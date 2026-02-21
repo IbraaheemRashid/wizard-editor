@@ -1,8 +1,8 @@
 use std::path::Path;
 use std::process::Command;
 
-const THUMB_WIDTH: u32 = 280;
-const THUMB_HEIGHT: u32 = 160;
+const THUMB_WIDTH: u32 = 480;
+const THUMB_HEIGHT: u32 = 270;
 const EXPECTED_BYTES: usize = (THUMB_WIDTH * THUMB_HEIGHT * 4) as usize;
 
 pub fn extract_thumbnail(path: &Path) -> Option<image::RgbaImage> {
@@ -16,11 +16,38 @@ pub fn extract_preview_frames(path: &Path, count: usize) -> Vec<image::RgbaImage
         _ => return Vec::new(),
     };
 
-    let mut frames = Vec::with_capacity(count);
-    for i in 0..count {
-        let t = (i as f64 / count as f64) * duration;
-        let seek = format!("{:.3}", t);
-        if let Some(img) = try_extract_at(path, &seek) {
+    if count <= 1 {
+        return try_extract_at(path, "0").into_iter().collect();
+    }
+
+    let fps = (count as f64 / duration).clamp(0.5, 30.0);
+    let vf = format!(
+        "fps={fps},scale={THUMB_WIDTH}:{THUMB_HEIGHT}:force_original_aspect_ratio=decrease,pad={THUMB_WIDTH}:{THUMB_HEIGHT}:(ow-iw)/2:(oh-ih)/2"
+    );
+
+    let output = Command::new("ffmpeg")
+        .args(["-v", "quiet"])
+        .args(["-i"])
+        .arg(path)
+        .args(["-vf", &vf])
+        .args(["-frames:v", &count.to_string()])
+        .args(["-f", "rawvideo"])
+        .args(["-pix_fmt", "rgba"])
+        .args(["pipe:1"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .output();
+
+    let Ok(output) = output else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+
+    let mut frames = Vec::new();
+    for chunk in output.stdout.chunks_exact(EXPECTED_BYTES) {
+        if let Some(img) = image::RgbaImage::from_raw(THUMB_WIDTH, THUMB_HEIGHT, chunk.to_vec()) {
             frames.push(img);
         }
     }

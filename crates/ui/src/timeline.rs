@@ -11,17 +11,16 @@ const RULER_HEIGHT: f32 = 24.0;
 const PIXELS_PER_SECOND: f32 = 100.0;
 
 pub fn timeline_panel(ui: &mut egui::Ui, state: &mut AppState) {
+    state.ui.timeline_scrubbing = None;
+    ui.set_min_width(0.0);
+    ui.set_min_height(0.0);
+
     ui.heading("Timeline");
     ui.separator();
 
     let available = ui.available_rect_before_wrap();
-    let timeline_rect = Rect::from_min_size(
-        available.min,
-        vec2(
-            available.width(),
-            RULER_HEIGHT + state.tracks.len() as f32 * (TRACK_HEIGHT + 2.0),
-        ),
-    );
+    let content_height = RULER_HEIGHT + state.project.tracks.len() as f32 * (TRACK_HEIGHT + 2.0);
+    let timeline_rect = Rect::from_min_size(available.min, vec2(available.width(), content_height));
 
     let content_left = timeline_rect.min.x + TRACK_HEADER_WIDTH;
     let content_width = timeline_rect.width() - TRACK_HEADER_WIDTH;
@@ -30,18 +29,15 @@ pub fn timeline_panel(ui: &mut egui::Ui, state: &mut AppState) {
 
     let tracks_top = timeline_rect.min.y + RULER_HEIGHT;
     let mut pending_drop: Option<(ClipId, usize, f64)> = None;
-    for (i, track) in state.tracks.iter().enumerate() {
+    for (i, track) in state.project.tracks.iter().enumerate() {
         let y = tracks_top + i as f32 * (TRACK_HEIGHT + 2.0);
 
         let header_rect = Rect::from_min_size(
             pos2(timeline_rect.min.x, y),
             vec2(TRACK_HEADER_WIDTH, TRACK_HEIGHT),
         );
-        ui.painter().rect_filled(
-            header_rect,
-            CornerRadius::ZERO,
-            Color32::from_rgb(35, 35, 55),
-        );
+        ui.painter()
+            .rect_filled(header_rect, CornerRadius::ZERO, theme::TRACK_HEADER_BG);
         ui.painter().text(
             header_rect.center(),
             egui::Align2::CENTER_CENTER,
@@ -86,7 +82,7 @@ pub fn timeline_panel(ui: &mut egui::Ui, state: &mut AppState) {
             ui.painter()
                 .rect_filled(clip_rect, theme::ROUNDING_SM, clip_color);
 
-            if let Some(clip) = state.clips.get(&tc.clip_id) {
+            if let Some(clip) = state.project.clips.get(&tc.clip_id) {
                 let label = if clip.filename.len() > 15 {
                     format!("{}...", &clip.filename[..12])
                 } else {
@@ -101,7 +97,7 @@ pub fn timeline_panel(ui: &mut egui::Ui, state: &mut AppState) {
                 );
             }
 
-            if state.starred.contains(&tc.clip_id) {
+            if state.project.starred.contains(&tc.clip_id) {
                 ui.painter().text(
                     clip_rect.right_top() + vec2(-12.0, 2.0),
                     egui::Align2::CENTER_TOP,
@@ -114,12 +110,14 @@ pub fn timeline_panel(ui: &mut egui::Ui, state: &mut AppState) {
     }
 
     if let Some((clip_id, track_index, position_seconds)) = pending_drop {
-        state.add_clip_to_track(clip_id, track_index, position_seconds);
+        state
+            .project
+            .add_clip_to_track(clip_id, track_index, position_seconds);
     }
 
-    let playhead_x = content_left + state.playback.playhead as f32 * PIXELS_PER_SECOND;
+    let playhead_x = content_left + state.project.playback.playhead as f32 * PIXELS_PER_SECOND;
     let playhead_top = timeline_rect.min.y;
-    let playhead_bottom = tracks_top + state.tracks.len() as f32 * (TRACK_HEIGHT + 2.0);
+    let playhead_bottom = tracks_top + state.project.tracks.len() as f32 * (TRACK_HEIGHT + 2.0);
     ui.painter().line_segment(
         [
             pos2(playhead_x, playhead_top),
@@ -141,18 +139,16 @@ pub fn timeline_panel(ui: &mut egui::Ui, state: &mut AppState) {
     if scrub_response.dragged() || scrub_response.clicked() {
         if let Some(pointer) = scrub_response.interact_pointer_pos() {
             let t = ((pointer.x - content_left) / PIXELS_PER_SECOND).max(0.0) as f64;
-            state.playback.playhead = t;
+            state.project.playback.playhead = t;
+            state.ui.timeline_scrubbing = Some(t);
         }
     }
 }
 
 fn draw_ruler(ui: &mut egui::Ui, left: f32, top: f32, width: f32) {
     let ruler_rect = Rect::from_min_size(pos2(left, top), vec2(width, RULER_HEIGHT));
-    ui.painter().rect_filled(
-        ruler_rect,
-        CornerRadius::ZERO,
-        Color32::from_rgb(20, 20, 35),
-    );
+    ui.painter()
+        .rect_filled(ruler_rect, CornerRadius::ZERO, theme::RULER_BG);
 
     let total_seconds = (width / PIXELS_PER_SECOND) as i32 + 1;
     for s in 0..total_seconds {
@@ -184,7 +180,7 @@ fn draw_ruler(ui: &mut egui::Ui, left: f32, top: f32, width: f32) {
                         pos2(sub_x, top + RULER_HEIGHT - 4.0),
                         pos2(sub_x, top + RULER_HEIGHT),
                     ],
-                    Stroke::new(0.5, Color32::from_rgb(60, 60, 80)),
+                    Stroke::new(0.5, theme::RULER_TICK),
                 );
             }
         }

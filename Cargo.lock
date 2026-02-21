@@ -4968,7 +4968,6 @@ dependencies = [
 name = "wizard-state"
 version = "0.1.0"
 dependencies = [
- "egui",
  "uuid",
 ]
 
@@ -4978,9 +4977,7 @@ version = "0.1.0"
 dependencies = [
  "egui",
  "egui_extras",
- "image",
  "rfd",
- "wizard-media",
  "wizard-state",
 ]
 

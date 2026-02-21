@@ -1,6 +1,9 @@
 use std::path::{Path, PathBuf};
 
-const VIDEO_EXTENSIONS: &[&str] = &["mp4", "mov", "avi", "mkv", "webm", "m4v", "mxf"];
+pub const VIDEO_EXTENSIONS: &[&str] = &[
+    "mp4", "mov", "avi", "mkv", "webm", "m4v", "mxf", "ts", "mts", "m2ts", "flv", "wmv", "mpg",
+    "mpeg", "vob", "3gp", "3g2", "ogv", "f4v", "divx", "asf", "rm", "rmvb", "dv", "r3d", "braw",
+];
 
 pub fn scan_folder(path: &Path) -> Vec<PathBuf> {
     let mut results = Vec::new();

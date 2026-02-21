@@ -5,4 +5,3 @@ edition = "2021"
 
 [dependencies]
 uuid = { workspace = true }
-egui = { workspace = true }

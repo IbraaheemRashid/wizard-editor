@@ -1,6 +1,8 @@
 use std::path::PathBuf;
 use uuid::Uuid;
 
+use crate::tag::Tag;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ClipId(Uuid);
 
@@ -24,6 +26,7 @@ pub struct Clip {
     pub duration: Option<f64>,
     pub resolution: Option<(u32, u32)>,
     pub codec: Option<String>,
+    pub search_haystack: String,
 }
 
 impl Clip {
@@ -32,6 +35,7 @@ impl Clip {
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
+        let search_haystack = filename.to_lowercase();
         Self {
             id: ClipId::new(),
             path,
@@ -39,6 +43,40 @@ impl Clip {
             duration: None,
             resolution: None,
             codec: None,
+            search_haystack,
         }
+    }
+
+    pub fn rebuild_search_haystack(&mut self, tag_mask: u32) {
+        let mut haystack = self.filename.to_lowercase();
+
+        if let Some(codec) = &self.codec {
+            haystack.push(' ');
+            haystack.push_str(&codec.to_lowercase());
+        }
+
+        if let Some((w, h)) = self.resolution {
+            haystack.push(' ');
+            haystack.push_str(&format!("{w}x{h}"));
+        }
+
+        if let Some(dur) = self.duration {
+            let dur_i = dur.round().max(0.0) as i64;
+            let m = dur_i / 60;
+            let s = dur_i % 60;
+            haystack.push(' ');
+            haystack.push_str(&format!("{m}:{s:02}"));
+            haystack.push(' ');
+            haystack.push_str(&dur_i.to_string());
+        }
+
+        for tag in Tag::ALL {
+            if (tag_mask & tag.bit()) != 0 {
+                haystack.push(' ');
+                haystack.push_str(&tag.label().to_lowercase());
+            }
+        }
+
+        self.search_haystack = haystack;
     }
 }

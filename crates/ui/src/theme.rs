@@ -11,6 +11,9 @@ pub const CLIP_VIDEO: Color32 = Color32::from_rgb(60, 100, 180);
 pub const CLIP_AUDIO: Color32 = Color32::from_rgb(80, 160, 100);
 pub const PLAYHEAD_COLOR: Color32 = Color32::from_rgb(255, 80, 80);
 pub const STAR_COLOR: Color32 = Color32::from_rgb(255, 200, 50);
+pub const TRACK_HEADER_BG: Color32 = Color32::from_rgb(35, 35, 55);
+pub const RULER_BG: Color32 = Color32::from_rgb(20, 20, 35);
+pub const RULER_TICK: Color32 = Color32::from_rgb(60, 60, 80);
 
 pub const ROUNDING: CornerRadius = CornerRadius::same(4);
 pub const ROUNDING_SM: CornerRadius = CornerRadius::same(3);

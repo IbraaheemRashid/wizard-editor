@@ -1,14 +1,9 @@
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PlaybackState {
+    #[default]
     Stopped,
     Playing,
     PlayingReverse,
-}
-
-impl Default for PlaybackState {
-    fn default() -> Self {
-        Self::Stopped
-    }
 }
 
 #[derive(Debug, Clone)]

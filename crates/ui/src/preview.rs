@@ -2,16 +2,17 @@ use egui::vec2;
 use wizard_state::playback::PlaybackState;
 use wizard_state::project::AppState;
 
+use crate::browser::TextureLookup;
 use crate::theme;
 
-pub fn preview_panel(ui: &mut egui::Ui, state: &AppState) {
+pub fn preview_panel(ui: &mut egui::Ui, state: &AppState, textures: &dyn TextureLookup) {
     let available = ui.available_size();
 
-    match state.selection.selected_clip {
+    match state.ui.selection.selected_clip {
         Some(clip_id) => {
-            if let Some(clip) = state.clips.get(&clip_id) {
+            if let Some(clip) = state.project.clips.get(&clip_id) {
                 ui.vertical_centered(|ui| {
-                    if let Some(tex) = state.thumbnails.get(&clip_id) {
+                    if let Some(tex) = textures.thumbnail(&clip_id) {
                         let tex_size = tex.size_vec2();
                         let scale = (available.x / tex_size.x)
                             .min(available.y / tex_size.y)
@@ -55,14 +56,17 @@ pub fn preview_panel(ui: &mut egui::Ui, state: &AppState) {
                 ui.colored_label(theme::TEXT_DIM, "Import media to begin");
                 ui.add_space(8.0);
 
-                let status = match state.playback.state {
+                let status = match state.project.playback.state {
                     PlaybackState::Stopped => "Stopped",
                     PlaybackState::Playing => "Playing",
                     PlaybackState::PlayingReverse => "Reverse",
                 };
                 ui.colored_label(
                     theme::TEXT_DIM,
-                    format!("Playhead: {:.2}s  |  {}", state.playback.playhead, status),
+                    format!(
+                        "Playhead: {:.2}s  |  {}",
+                        state.project.playback.playhead, status
+                    ),
                 );
             });
         }

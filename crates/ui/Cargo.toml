@@ -8,5 +8,3 @@ wizard-state = { workspace = true }
 egui = { workspace = true }
 egui_extras = { workspace = true }
 rfd = { workspace = true }
-wizard-media = { workspace = true }
-image = { workspace = true }
