@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use egui::{vec2, Color32, Id, Rect, Sense, Stroke, StrokeKind, Vec2};
 use wizard_state::clip::ClipId;
-use wizard_state::project::AppState;
+use wizard_state::project::{AppState, SortMode};
 use wizard_state::tag::Tag;
 
 use crate::constants;
@@ -19,6 +19,7 @@ pub trait TextureLookup {
     fn thumbnail(&self, id: &ClipId) -> Option<&egui::TextureHandle>;
     fn preview_frames(&self, id: &ClipId) -> Option<&Vec<egui::TextureHandle>>;
     fn is_pending(&self, id: &ClipId) -> bool;
+    fn waveform_peaks(&self, id: &ClipId) -> Option<&Vec<(f32, f32)>>;
 }
 
 pub fn browser_panel(
@@ -84,6 +85,30 @@ pub fn browser_panel(
                     state.ui.tag_filter_mask = 0;
                 }
             });
+            ui.add_space(2.0);
+            ui.horizontal(|ui| {
+                ui.label("Sort:");
+                let current_label = state.ui.sort_mode.label();
+                egui::ComboBox::from_id_salt("sort_mode")
+                    .selected_text(current_label)
+                    .show_ui(ui, |ui| {
+                        for &mode in SortMode::ALL {
+                            ui.selectable_value(&mut state.ui.sort_mode, mode, mode.label());
+                        }
+                    });
+                let label = if state.ui.sort_ascending {
+                    "A-Z"
+                } else {
+                    "Z-A"
+                };
+                if ui
+                    .button(label)
+                    .on_hover_text("Toggle sort direction")
+                    .clicked()
+                {
+                    state.ui.sort_ascending = !state.ui.sort_ascending;
+                }
+            });
             ui.add_space(4.0);
 
             let filtered = state.filtered_clips();
@@ -125,6 +150,45 @@ pub fn browser_panel(
                 state.ui.hover_started_at = None;
             }
         });
+
+    if let Some(pointer) = ui.ctx().pointer_interact_pos() {
+        if let Some(payload) = egui::DragAndDrop::payload::<ClipId>(ui.ctx()) {
+            let dragged_id = *payload;
+            let painter = ui.ctx().layer_painter(egui::LayerId::new(
+                egui::Order::Tooltip,
+                Id::new("drag_preview"),
+            ));
+            let preview_size = vec2(80.0, 60.0);
+            let preview_rect = Rect::from_min_size(pointer + vec2(8.0, 8.0), preview_size);
+            let tint = Color32::WHITE.gamma_multiply(0.7);
+            let uv = Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+            if let Some(tex) = textures.thumbnail(&dragged_id) {
+                painter.image(tex.id(), preview_rect, uv, tint);
+            } else {
+                painter.rect_filled(
+                    preview_rect,
+                    theme::ROUNDING,
+                    theme::BG_SURFACE.gamma_multiply(0.7),
+                );
+            }
+            if let Some(clip) = state.project.clips.get(&dragged_id) {
+                let name = clip.display_name();
+                let label = if name.len() > 14 {
+                    format!("{}...", &name[..11])
+                } else {
+                    name.to_string()
+                };
+                painter.text(
+                    egui::pos2(preview_rect.center().x, preview_rect.max.y + 2.0),
+                    egui::Align2::CENTER_TOP,
+                    label,
+                    egui::FontId::proportional(10.0),
+                    theme::TEXT_PRIMARY,
+                );
+            }
+        }
+    }
+
     action
 }
 
@@ -139,7 +203,7 @@ fn clip_thumbnail(
         Some(c) => c,
         None => return false,
     };
-    let filename = clip.filename.clone();
+    let display_name_str = clip.display_name().to_string();
     let duration = clip.duration;
     let resolution = clip.resolution;
     let is_starred = state.project.starred.contains(&clip_id);
@@ -151,9 +215,7 @@ fn clip_thumbnail(
         Sense::click_and_drag(),
     );
 
-    if !is_selected {
-        response.dnd_set_drag_payload(clip_id);
-    }
+    response.dnd_set_drag_payload(clip_id);
 
     let is_hovered = response.hovered();
     let now = ui.input(|i| i.time);
@@ -184,6 +246,18 @@ fn clip_thumbnail(
         let star_text = if is_starred { "Unstar" } else { "Star" };
         if ui.button(star_text).clicked() {
             state.project.toggle_star(clip_id);
+            ui.close_menu();
+        }
+
+        if ui.button("Rename").clicked() {
+            let current_name = state
+                .project
+                .clips
+                .get(&clip_id)
+                .map(|c| c.display_name().to_string())
+                .unwrap_or_default();
+            state.ui.renaming_clip = Some(clip_id);
+            state.ui.rename_buffer = current_name;
             ui.close_menu();
         }
 
@@ -345,19 +419,47 @@ fn clip_thumbnail(
             );
         }
 
-        let label_pos = egui::pos2(rect.min.x, thumb_rect.max.y + 2.0);
-        let truncated = if filename.len() > 20 {
-            format!("{}...", &filename[..17])
-        } else {
-            filename
-        };
-        ui.painter().text(
-            label_pos,
-            egui::Align2::LEFT_TOP,
-            truncated,
-            egui::FontId::proportional(11.0),
-            theme::TEXT_PRIMARY,
+        let label_rect = Rect::from_min_size(
+            egui::pos2(rect.min.x, thumb_rect.max.y + 2.0),
+            vec2(thumb_size.x, 16.0),
         );
+        let is_renaming = state.ui.renaming_clip == Some(clip_id);
+        if is_renaming {
+            let text_edit = egui::TextEdit::singleline(&mut state.ui.rename_buffer)
+                .desired_width(thumb_size.x)
+                .font(egui::FontId::proportional(11.0));
+            let re = ui.put(label_rect, text_edit);
+            if re.lost_focus() {
+                let escaped = ui.input(|i| i.key_pressed(egui::Key::Escape));
+                if !escaped {
+                    let new_name = state.ui.rename_buffer.trim().to_string();
+                    if !new_name.is_empty() {
+                        let tag_mask = state.project.clip_tag_mask(clip_id);
+                        if let Some(clip) = state.project.clips.get_mut(&clip_id) {
+                            clip.display_name = Some(new_name);
+                            clip.rebuild_search_haystack(tag_mask);
+                        }
+                    }
+                }
+                state.ui.renaming_clip = None;
+                state.ui.rename_buffer.clear();
+            } else {
+                re.request_focus();
+            }
+        } else {
+            let truncated = if display_name_str.len() > 20 {
+                format!("{}...", &display_name_str[..17])
+            } else {
+                display_name_str.clone()
+            };
+            ui.painter().text(
+                label_rect.min,
+                egui::Align2::LEFT_TOP,
+                truncated,
+                egui::FontId::proportional(11.0),
+                theme::TEXT_PRIMARY,
+            );
+        }
 
         let meta_y = thumb_rect.max.y + 15.0;
         let mut meta_parts: Vec<String> = Vec::new();

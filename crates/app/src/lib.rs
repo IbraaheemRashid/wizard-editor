@@ -59,6 +59,7 @@ pub struct TextureCache {
     pub preview_frames: HashMap<ClipId, Vec<egui::TextureHandle>>,
     pub pending_thumbnails: HashSet<ClipId>,
     pub preview_requested: HashSet<ClipId>,
+    pub waveforms: HashMap<ClipId, Vec<(f32, f32)>>,
 }
 
 impl wizard_ui::browser::TextureLookup for TextureCache {
@@ -72,6 +73,10 @@ impl wizard_ui::browser::TextureLookup for TextureCache {
 
     fn is_pending(&self, id: &ClipId) -> bool {
         self.pending_thumbnails.contains(id)
+    }
+
+    fn waveform_peaks(&self, id: &ClipId) -> Option<&Vec<(f32, f32)>> {
+        self.waveforms.get(id)
     }
 }
 
@@ -89,6 +94,8 @@ pub struct EditorApp {
     audio_req_tx: mpsc::Sender<AudioPreviewRequest>,
     audio_snippet_rx: mpsc::Receiver<AudioSnippet>,
     last_audio_request: Option<(ClipId, i64)>,
+    waveform_tx: mpsc::Sender<(ClipId, Vec<(f32, f32)>)>,
+    waveform_rx: mpsc::Receiver<(ClipId, Vec<(f32, f32)>)>,
 }
 
 impl EditorApp {
@@ -125,6 +132,8 @@ impl EditorApp {
                 let _ = preview_result_tx.send((clip_id, frames));
             }
         });
+
+        let (waveform_tx, waveform_rx) = mpsc::channel::<(ClipId, Vec<(f32, f32)>)>();
 
         let audio_output = AudioOutput::new().ok();
         let (audio_req_tx, audio_req_rx) = mpsc::channel();
@@ -182,6 +191,8 @@ impl EditorApp {
             audio_req_tx,
             audio_snippet_rx,
             last_audio_request: None,
+            waveform_tx,
+            waveform_rx,
         }
     }
 
@@ -233,6 +244,11 @@ impl EditorApp {
                 })
                 .collect();
             self.textures.preview_frames.insert(id, textures);
+            received = true;
+        }
+
+        while let Ok((id, peaks)) = self.waveform_rx.try_recv() {
+            self.textures.waveforms.insert(id, peaks);
             received = true;
         }
 
@@ -401,12 +417,18 @@ impl EditorApp {
 
             let ttx = self.thumb_tx.clone();
             let mtx = self.meta_tx.clone();
+            let wtx = self.waveform_tx.clone();
             std::thread::spawn(move || {
                 let meta = wizard_media::metadata::extract_metadata(&p);
                 let _ = mtx.send((clip_id, meta));
 
                 if let Some(img) = wizard_media::thumbnail::extract_thumbnail(&p) {
                     let _ = ttx.send((clip_id, img));
+                }
+
+                let peaks = wizard_media::audio::extract_waveform_peaks(&p, 512);
+                if !peaks.is_empty() {
+                    let _ = wtx.send((clip_id, peaks));
                 }
             });
         }
@@ -488,7 +510,7 @@ impl eframe::App for EditorApp {
             .height_range(40.0..=800.0)
             .default_height(250.0)
             .show(ctx, |ui| {
-                wizard_ui::timeline::timeline_panel(ui, &mut self.state);
+                wizard_ui::timeline::timeline_panel(ui, &mut self.state, &self.textures);
             });
 
         egui::CentralPanel::default().show(ctx, |ui| {

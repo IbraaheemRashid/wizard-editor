@@ -23,10 +23,21 @@ pub struct Clip {
     pub id: ClipId,
     pub path: PathBuf,
     pub filename: String,
+    pub display_name: Option<String>,
     pub duration: Option<f64>,
     pub resolution: Option<(u32, u32)>,
     pub codec: Option<String>,
     pub search_haystack: String,
+}
+
+impl Clip {
+    pub fn display_name(&self) -> &str {
+        self.display_name.as_deref().unwrap_or(&self.filename)
+    }
+
+    pub fn extension(&self) -> &str {
+        self.path.extension().and_then(|e| e.to_str()).unwrap_or("")
+    }
 }
 
 impl Clip {
@@ -35,11 +46,18 @@ impl Clip {
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
-        let search_haystack = filename.to_lowercase();
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+        let mut search_haystack = filename.to_lowercase();
+        if !ext.is_empty() {
+            search_haystack.push(' ');
+            search_haystack.push('.');
+            search_haystack.push_str(&ext.to_lowercase());
+        }
         Self {
             id: ClipId::new(),
             path,
             filename,
+            display_name: None,
             duration: None,
             resolution: None,
             codec: None,
@@ -49,6 +67,18 @@ impl Clip {
 
     pub fn rebuild_search_haystack(&mut self, tag_mask: u32) {
         let mut haystack = self.filename.to_lowercase();
+
+        if let Some(name) = &self.display_name {
+            haystack.push(' ');
+            haystack.push_str(&name.to_lowercase());
+        }
+
+        let ext = self.extension();
+        if !ext.is_empty() {
+            haystack.push(' ');
+            haystack.push('.');
+            haystack.push_str(&ext.to_lowercase());
+        }
 
         if let Some(codec) = &self.codec {
             haystack.push(' ');

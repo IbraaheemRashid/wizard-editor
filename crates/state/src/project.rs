@@ -4,7 +4,36 @@ use crate::clip::{Clip, ClipId};
 use crate::playback::Playback;
 use crate::selection::Selection;
 use crate::tag::Tag;
-use crate::timeline::{self, TimelineClip, Track};
+use crate::timeline::{self, TimelineClip, Track, TrackId};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SortMode {
+    ImportOrder,
+    Name,
+    Duration,
+    Resolution,
+    FileType,
+}
+
+impl SortMode {
+    pub const ALL: &'static [SortMode] = &[
+        SortMode::ImportOrder,
+        SortMode::Name,
+        SortMode::Duration,
+        SortMode::Resolution,
+        SortMode::FileType,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            SortMode::ImportOrder => "Import Order",
+            SortMode::Name => "Name",
+            SortMode::Duration => "Duration",
+            SortMode::Resolution => "Resolution",
+            SortMode::FileType => "File Type",
+        }
+    }
+}
 
 pub struct ProjectState {
     pub clips: HashMap<ClipId, Clip>,
@@ -55,6 +84,33 @@ impl ProjectState {
         ui.tag_filter_mask ^= tag.bit();
     }
 
+    pub fn move_clip_on_track(&mut self, track_index: usize, clip_idx: usize, new_position: f64) {
+        let Some(track) = self.tracks.get_mut(track_index) else {
+            return;
+        };
+        if clip_idx < track.clips.len() {
+            track.clips[clip_idx].position = new_position.max(0.0);
+        }
+    }
+
+    pub fn move_clip_across_tracks(
+        &mut self,
+        src_track: usize,
+        clip_idx: usize,
+        dst_track: usize,
+        new_position: f64,
+    ) {
+        if src_track >= self.tracks.len() || dst_track >= self.tracks.len() {
+            return;
+        }
+        if clip_idx >= self.tracks[src_track].clips.len() {
+            return;
+        }
+        let mut clip = self.tracks[src_track].clips.remove(clip_idx);
+        clip.position = new_position.max(0.0);
+        self.tracks[dst_track].clips.push(clip);
+    }
+
     pub fn add_clip_to_track(
         &mut self,
         clip_id: ClipId,
@@ -95,6 +151,13 @@ pub struct UiState {
     pub fps: f32,
     pub timeline_scrubbing: Option<f64>,
     pub show_browser: bool,
+    pub sort_mode: SortMode,
+    pub sort_ascending: bool,
+    pub renaming_clip: Option<ClipId>,
+    pub rename_buffer: String,
+    pub timeline_zoom: f32,
+    pub timeline_scroll_offset: f32,
+    pub timeline_dragging_clip: Option<(TrackId, usize)>,
 }
 
 impl Default for UiState {
@@ -112,6 +175,13 @@ impl Default for UiState {
             fps: 0.0,
             timeline_scrubbing: None,
             show_browser: true,
+            sort_mode: SortMode::ImportOrder,
+            sort_ascending: true,
+            renaming_clip: None,
+            rename_buffer: String::new(),
+            timeline_zoom: 100.0,
+            timeline_scroll_offset: 0.0,
+            timeline_dragging_clip: None,
         }
     }
 }
@@ -126,7 +196,8 @@ impl AppState {
     pub fn filtered_clips(&self) -> Vec<ClipId> {
         let query = self.ui.search_query.to_lowercase();
         let tokens: Vec<&str> = query.split_whitespace().filter(|t| !t.is_empty()).collect();
-        self.project
+        let mut result: Vec<ClipId> = self
+            .project
             .clip_order
             .iter()
             .filter(|id| {
@@ -149,6 +220,74 @@ impl AppState {
                 tokens.iter().all(|t| clip.search_haystack.contains(t))
             })
             .copied()
-            .collect()
+            .collect();
+
+        let clips = &self.project.clips;
+        let ascending = self.ui.sort_ascending;
+        match self.ui.sort_mode {
+            SortMode::ImportOrder => {
+                if !ascending {
+                    result.reverse();
+                }
+            }
+            SortMode::Name => {
+                result.sort_by(|a, b| {
+                    let na = clips.get(a).map(|c| c.display_name()).unwrap_or("");
+                    let nb = clips.get(b).map(|c| c.display_name()).unwrap_or("");
+                    let ord = na.to_lowercase().cmp(&nb.to_lowercase());
+                    if ascending {
+                        ord
+                    } else {
+                        ord.reverse()
+                    }
+                });
+            }
+            SortMode::Duration => {
+                result.sort_by(|a, b| {
+                    let da = clips.get(a).and_then(|c| c.duration).unwrap_or(0.0);
+                    let db = clips.get(b).and_then(|c| c.duration).unwrap_or(0.0);
+                    let ord = da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal);
+                    if ascending {
+                        ord
+                    } else {
+                        ord.reverse()
+                    }
+                });
+            }
+            SortMode::Resolution => {
+                result.sort_by(|a, b| {
+                    let ra = clips
+                        .get(a)
+                        .and_then(|c| c.resolution)
+                        .map(|(w, h)| w * h)
+                        .unwrap_or(0);
+                    let rb = clips
+                        .get(b)
+                        .and_then(|c| c.resolution)
+                        .map(|(w, h)| w * h)
+                        .unwrap_or(0);
+                    let ord = ra.cmp(&rb);
+                    if ascending {
+                        ord
+                    } else {
+                        ord.reverse()
+                    }
+                });
+            }
+            SortMode::FileType => {
+                result.sort_by(|a, b| {
+                    let ea = clips.get(a).map(|c| c.extension()).unwrap_or("");
+                    let eb = clips.get(b).map(|c| c.extension()).unwrap_or("");
+                    let ord = ea.to_lowercase().cmp(&eb.to_lowercase());
+                    if ascending {
+                        ord
+                    } else {
+                        ord.reverse()
+                    }
+                });
+            }
+        }
+
+        result
     }
 }
