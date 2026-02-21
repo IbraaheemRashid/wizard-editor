@@ -1,0 +1,70 @@
+use egui::vec2;
+use wizard_state::playback::PlaybackState;
+use wizard_state::project::AppState;
+
+use crate::theme;
+
+pub fn preview_panel(ui: &mut egui::Ui, state: &AppState) {
+    let available = ui.available_size();
+
+    match state.selection.selected_clip {
+        Some(clip_id) => {
+            if let Some(clip) = state.clips.get(&clip_id) {
+                ui.vertical_centered(|ui| {
+                    if let Some(tex) = state.thumbnails.get(&clip_id) {
+                        let tex_size = tex.size_vec2();
+                        let scale = (available.x / tex_size.x)
+                            .min(available.y / tex_size.y)
+                            .min(1.0);
+                        let display_size = tex_size * scale;
+                        ui.image(egui::load::SizedTexture::new(tex.id(), display_size));
+                    } else {
+                        let preview_rect = egui::Rect::from_center_size(
+                            ui.available_rect_before_wrap().center(),
+                            vec2(320.0, 180.0),
+                        );
+                        ui.painter()
+                            .rect_filled(preview_rect, theme::ROUNDING, theme::BG_SURFACE);
+                        ui.painter().text(
+                            preview_rect.center(),
+                            egui::Align2::CENTER_CENTER,
+                            "Preview",
+                            egui::FontId::proportional(16.0),
+                            theme::TEXT_DIM,
+                        );
+                        ui.allocate_rect(preview_rect, egui::Sense::hover());
+                    }
+
+                    ui.add_space(8.0);
+                    ui.colored_label(theme::TEXT_PRIMARY, &clip.filename);
+
+                    if let Some(dur) = clip.duration {
+                        let m = (dur as i32) / 60;
+                        let s = (dur as i32) % 60;
+                        ui.colored_label(theme::TEXT_DIM, format!("Duration: {m}:{s:02}"));
+                    }
+                    if let Some((w, h)) = clip.resolution {
+                        ui.colored_label(theme::TEXT_DIM, format!("{w}x{h}"));
+                    }
+                });
+            }
+        }
+        None => {
+            ui.vertical_centered(|ui| {
+                ui.add_space(available.y / 2.0 - 20.0);
+                ui.colored_label(theme::TEXT_DIM, "Import media to begin");
+                ui.add_space(8.0);
+
+                let status = match state.playback.state {
+                    PlaybackState::Stopped => "Stopped",
+                    PlaybackState::Playing => "Playing",
+                    PlaybackState::PlayingReverse => "Reverse",
+                };
+                ui.colored_label(
+                    theme::TEXT_DIM,
+                    format!("Playhead: {:.2}s  |  {}", state.playback.playhead, status),
+                );
+            });
+        }
+    }
+}

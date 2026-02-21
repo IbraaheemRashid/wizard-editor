@@ -1,0 +1,26 @@
+[workspace]
+members = [
+    "crates/app",
+    "crates/state",
+    "crates/ui",
+    "crates/media",
+    "crates/audio",
+]
+resolver = "2"
+
+[workspace.dependencies]
+eframe = { version = "0.31", features = ["wgpu"] }
+egui = "0.31"
+egui_extras = { version = "0.31", features = ["image"] }
+image = "0.25"
+cpal = "0.15"
+rfd = "0.15"
+uuid = { version = "1", features = ["v4"] }
+rayon = "1.10"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+wizard-state = { path = "crates/state" }
+wizard-ui = { path = "crates/ui" }
+wizard-media = { path = "crates/media" }
+wizard-audio = { path = "crates/audio" }

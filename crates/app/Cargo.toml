@@ -1,0 +1,13 @@
+[package]
+name = "wizard-app"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+wizard-state = { workspace = true }
+wizard-ui = { workspace = true }
+wizard-media = { workspace = true }
+wizard-audio = { workspace = true }
+eframe = { workspace = true }
+egui = { workspace = true }
+image = { workspace = true }

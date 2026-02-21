@@ -1,0 +1,8 @@
+[package]
+name = "wizard-audio"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+wizard-state = { workspace = true }
+cpal = { workspace = true }
