@@ -796,7 +796,7 @@ impl eframe::App for EditorApp {
             let mut action = wizard_ui::browser::BrowserAction::None;
             egui::SidePanel::left("browser_panel")
                 .width_range(200.0..=1200.0)
-                .default_width(420.0)
+                .default_width(425.0)
                 .show(ctx, |ui| {
                     action = wizard_ui::browser::browser_panel(ui, &mut self.state, &self.textures);
                 });
@@ -836,7 +836,7 @@ impl eframe::App for EditorApp {
         egui::TopBottomPanel::bottom("timeline_panel")
             .resizable(true)
             .height_range(40.0..=800.0)
-            .default_height(250.0)
+            .default_height(465.0)
             .show(ctx, |ui| {
                 wizard_ui::timeline::timeline_panel(ui, &mut self.state, &self.textures);
             });

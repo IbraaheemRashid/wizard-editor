@@ -5,6 +5,7 @@ use wizard_state::timeline::{TimelineClipId, TrackId, TrackKind};
 
 use crate::browser::TextureLookup;
 use crate::theme;
+use crate::waveform_gpu::waveform_paint_callback;
 
 const TRACK_HEIGHT: f32 = 60.0;
 const TRACK_HEADER_WIDTH: f32 = 60.0;
@@ -61,6 +62,7 @@ pub fn timeline_panel(ui: &mut egui::Ui, state: &mut AppState, textures: &dyn Te
 
     let available = ui.available_rect_before_wrap();
     let timeline_rect = Rect::from_min_size(available.min, available.size());
+    ui.allocate_rect(timeline_rect, Sense::hover());
 
     let content_left = timeline_rect.min.x + TRACK_HEADER_WIDTH;
     let content_width = timeline_rect.width() - TRACK_HEADER_WIDTH;
@@ -89,6 +91,12 @@ pub fn timeline_panel(ui: &mut egui::Ui, state: &mut AppState, textures: &dyn Te
         vec2(content_width, total_height),
     );
     let content_painter = ui.painter().with_clip_rect(content_clip_rect);
+
+    let screen_size = ui.ctx().screen_rect().size();
+    let gpu_waveforms_available = ui
+        .ctx()
+        .data(|d| d.get_temp::<bool>(egui::Id::new("gpu_waveforms")))
+        .unwrap_or(false);
 
     for layout in &track_layouts {
         let track_id = layout.track_id;
@@ -134,7 +142,11 @@ pub fn timeline_panel(ui: &mut egui::Ui, state: &mut AppState, textures: &dyn Te
         let track_rect =
             Rect::from_min_size(pos2(content_left, y), vec2(content_width, TRACK_HEIGHT));
 
-        let track_response = ui.allocate_rect(track_rect, Sense::hover());
+        let track_response = ui.interact(
+            track_rect,
+            egui::Id::new(("track_drop", track_id)),
+            Sense::hover(),
+        );
 
         if let Some(payload) = track_response.dnd_release_payload::<ClipId>() {
             if let Some(pointer) = ui.ctx().pointer_interact_pos() {
@@ -187,7 +199,43 @@ pub fn timeline_panel(ui: &mut egui::Ui, state: &mut AppState, textures: &dyn Te
                 .timeline_dragging_clip
                 .is_some_and(|id| id == tc_id);
 
-            content_painter.rect_filled(clip_rect, theme::ROUNDING_SM, clip_color);
+            let mut drew_gpu_waveform = false;
+
+            if layout.kind == TrackKind::Audio && gpu_waveforms_available {
+                if let Some(peaks) = textures.waveform_peaks(&tc_source_id) {
+                    let visible_peaks = if let Some(clip) = state.project.clips.get(&tc_source_id) {
+                        if let Some(total_dur) = clip.duration {
+                            if total_dur > 0.0 {
+                                let in_frac = tc.source_in / total_dur;
+                                let out_frac = tc.source_out / total_dur;
+                                let start_idx = (in_frac * peaks.len() as f64) as usize;
+                                let end_idx = (out_frac * peaks.len() as f64) as usize;
+                                &peaks[start_idx.min(peaks.len())..end_idx.min(peaks.len())]
+                            } else {
+                                peaks.as_slice()
+                            }
+                        } else {
+                            peaks.as_slice()
+                        }
+                    } else {
+                        peaks.as_slice()
+                    };
+                    let wave_color =
+                        Color32::from_rgba_unmultiplied(180, 255, 200, 240);
+                    content_painter.add(waveform_paint_callback(
+                        clip_rect,
+                        visible_peaks,
+                        wave_color,
+                        clip_color,
+                        [screen_size.x, screen_size.y],
+                    ));
+                    drew_gpu_waveform = true;
+                }
+            }
+
+            if !drew_gpu_waveform {
+                content_painter.rect_filled(clip_rect, theme::ROUNDING_SM, clip_color);
+            }
 
             if layout.kind == TrackKind::Video {
                 let thumb_w = THUMB_WIDTH.min(clip_w);
@@ -197,7 +245,7 @@ pub fn timeline_panel(ui: &mut egui::Ui, state: &mut AppState, textures: &dyn Te
                     let uv = Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
                     content_painter.image(tex.id(), thumb_rect, uv, Color32::WHITE);
                 }
-            } else if layout.kind == TrackKind::Audio {
+            } else if layout.kind == TrackKind::Audio && !drew_gpu_waveform {
                 if let Some(peaks) = textures.waveform_peaks(&tc_source_id) {
                     let visible_peaks = if let Some(clip) = state.project.clips.get(&tc_source_id) {
                         if let Some(total_dur) = clip.duration {
@@ -361,7 +409,11 @@ pub fn timeline_panel(ui: &mut egui::Ui, state: &mut AppState, textures: &dyn Te
         pos2(content_left, timeline_rect.min.y),
         vec2(content_width, RULER_HEIGHT),
     );
-    let scrub_response = ui.allocate_rect(scrub_rect, Sense::click_and_drag());
+    let scrub_response = ui.interact(
+        scrub_rect,
+        egui::Id::new("timeline_scrub"),
+        Sense::click_and_drag(),
+    );
     if scrub_response.dragged() || scrub_response.clicked() {
         if let Some(pointer) = scrub_response.interact_pointer_pos() {
             let mut t = ((pointer.x - content_left + scroll) / pps).max(0.0) as f64;
@@ -395,7 +447,11 @@ pub fn timeline_panel(ui: &mut egui::Ui, state: &mut AppState, textures: &dyn Te
             if snapped {
                 let snap_line_top = tracks_top;
                 let snap_line_bottom = tracks_top + total_tracks as f32 * (TRACK_HEIGHT + 2.0);
-                ui.painter().line_segment(
+                let snap_clip = Rect::from_min_max(
+                    pos2(content_left, snap_line_top),
+                    pos2(content_left + content_width, snap_line_bottom),
+                );
+                ui.painter().with_clip_rect(snap_clip).line_segment(
                     [
                         pos2(playhead_x, snap_line_top),
                         pos2(playhead_x, snap_line_bottom),
@@ -408,7 +464,12 @@ pub fn timeline_panel(ui: &mut egui::Ui, state: &mut AppState, textures: &dyn Te
 
     let playhead_top = timeline_rect.min.y;
     let playhead_bottom = tracks_top + total_tracks as f32 * (TRACK_HEIGHT + 2.0);
-    ui.painter().line_segment(
+    let playhead_clip = Rect::from_min_max(
+        pos2(content_left, playhead_top),
+        pos2(content_left + content_width, playhead_bottom),
+    );
+    let playhead_painter = ui.painter().with_clip_rect(playhead_clip);
+    playhead_painter.line_segment(
         [
             pos2(playhead_x, playhead_top),
             pos2(playhead_x, playhead_bottom),
@@ -418,7 +479,7 @@ pub fn timeline_panel(ui: &mut egui::Ui, state: &mut AppState, textures: &dyn Te
 
     let playhead_head =
         Rect::from_center_size(pos2(playhead_x, playhead_top + 4.0), vec2(10.0, 8.0));
-    ui.painter()
+    playhead_painter
         .rect_filled(playhead_head, CornerRadius::same(2), theme::PLAYHEAD_COLOR);
 
     draw_scrollbar(
@@ -1026,6 +1087,8 @@ fn draw_ruler(ui: &mut egui::Ui, left: f32, top: f32, width: f32, pps: f32, scro
     ui.painter()
         .rect_filled(ruler_rect, CornerRadius::ZERO, theme::RULER_BG);
 
+    let ruler_painter = ui.painter().with_clip_rect(ruler_rect);
+
     let start_time = scroll / pps;
     let visible_duration = width / pps;
     let first_second = start_time.floor() as i32;
@@ -1040,7 +1103,7 @@ fn draw_ruler(ui: &mut egui::Ui, left: f32, top: f32, width: f32, pps: f32, scro
             continue;
         }
 
-        ui.painter().line_segment(
+        ruler_painter.line_segment(
             [
                 pos2(x, top + RULER_HEIGHT - 8.0),
                 pos2(x, top + RULER_HEIGHT),
@@ -1051,7 +1114,7 @@ fn draw_ruler(ui: &mut egui::Ui, left: f32, top: f32, width: f32, pps: f32, scro
         let minutes = s / 60;
         let secs = s % 60;
         let label = format!("{minutes}:{secs:02}");
-        ui.painter().text(
+        ruler_painter.text(
             pos2(x + 2.0, top + 2.0),
             egui::Align2::LEFT_TOP,
             label,
@@ -1062,7 +1125,7 @@ fn draw_ruler(ui: &mut egui::Ui, left: f32, top: f32, width: f32, pps: f32, scro
         for sub in 1..4 {
             let sub_x = x + sub as f32 * pps / 4.0;
             if sub_x >= left && sub_x < left + width {
-                ui.painter().line_segment(
+                ruler_painter.line_segment(
                     [
                         pos2(sub_x, top + RULER_HEIGHT - 4.0),
                         pos2(sub_x, top + RULER_HEIGHT),
