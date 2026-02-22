@@ -42,7 +42,7 @@ impl Playback {
         self.state = PlaybackState::Stopped;
     }
 
-    pub fn advance(&mut self, dt: f64) {
+    pub fn advance(&mut self, dt: f64, duration: f64) {
         match self.state {
             PlaybackState::Playing => self.playhead += dt * self.speed,
             PlaybackState::PlayingReverse => self.playhead -= dt * self.speed,
@@ -50,6 +50,10 @@ impl Playback {
         }
         if self.playhead < 0.0 {
             self.playhead = 0.0;
+            self.state = PlaybackState::Stopped;
+        }
+        if duration > 0.0 && self.playhead >= duration {
+            self.playhead = duration;
             self.state = PlaybackState::Stopped;
         }
     }

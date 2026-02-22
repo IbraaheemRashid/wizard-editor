@@ -1,108 +1,46 @@
 use std::path::Path;
-use std::process::Command;
+
+use crate::decoder::VideoDecoder;
 
 const THUMB_WIDTH: u32 = 480;
 const THUMB_HEIGHT: u32 = 270;
-const EXPECTED_BYTES: usize = (THUMB_WIDTH * THUMB_HEIGHT * 4) as usize;
+
+const PREVIEW_WIDTH: u32 = 960;
+const PREVIEW_HEIGHT: u32 = 540;
 
 pub fn extract_thumbnail(path: &Path) -> Option<image::RgbaImage> {
-    try_extract_at(path, "1").or_else(|| try_extract_at(path, "0"))
+    let mut decoder = VideoDecoder::open(path).ok()?;
+    decoder
+        .seek_and_decode(1.0, THUMB_WIDTH, THUMB_HEIGHT)
+        .or_else(|| decoder.seek_and_decode(0.0, THUMB_WIDTH, THUMB_HEIGHT))
 }
 
 pub fn extract_preview_frames(path: &Path, count: usize) -> Vec<image::RgbaImage> {
-    let duration = probe_duration(path);
-    let duration = match duration {
+    let mut decoder = match VideoDecoder::open(path) {
+        Ok(d) => d,
+        Err(_) => return Vec::new(),
+    };
+
+    let duration = match decoder.duration_seconds() {
         Some(d) if d > 0.0 => d,
         _ => return Vec::new(),
     };
 
     if count <= 1 {
-        return try_extract_at(path, "0").into_iter().collect();
+        return decoder
+            .seek_and_decode(0.0, THUMB_WIDTH, THUMB_HEIGHT)
+            .into_iter()
+            .collect();
     }
 
-    let fps = (count as f64 / duration).clamp(0.5, 30.0);
-    let vf = format!(
-        "fps={fps},scale={THUMB_WIDTH}:{THUMB_HEIGHT}:force_original_aspect_ratio=decrease,pad={THUMB_WIDTH}:{THUMB_HEIGHT}:(ow-iw)/2:(oh-ih)/2"
-    );
+    let times: Vec<f64> = (0..count)
+        .map(|i| i as f64 * duration / count as f64)
+        .collect();
 
-    let output = Command::new("ffmpeg")
-        .args(["-v", "quiet"])
-        .args(["-i"])
-        .arg(path)
-        .args(["-vf", &vf])
-        .args(["-frames:v", &count.to_string()])
-        .args(["-f", "rawvideo"])
-        .args(["-pix_fmt", "rgba"])
-        .args(["pipe:1"])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .output();
-
-    let Ok(output) = output else {
-        return Vec::new();
-    };
-    if !output.status.success() {
-        return Vec::new();
-    }
-
-    let mut frames = Vec::new();
-    for chunk in output.stdout.chunks_exact(EXPECTED_BYTES) {
-        if let Some(img) = image::RgbaImage::from_raw(THUMB_WIDTH, THUMB_HEIGHT, chunk.to_vec()) {
-            frames.push(img);
-        }
-    }
-    frames
+    decoder.decode_frames_at_times(&times, THUMB_WIDTH, THUMB_HEIGHT)
 }
 
-fn probe_duration(path: &Path) -> Option<f64> {
-    let output = Command::new("ffprobe")
-        .args([
-            "-v",
-            "quiet",
-            "-print_format",
-            "compact=print_section=0:nokey=1",
-            "-show_entries",
-            "format=duration",
-        ])
-        .arg(path)
-        .output()
-        .ok()?;
-
-    if !output.status.success() {
-        return None;
-    }
-
-    let text = String::from_utf8_lossy(&output.stdout);
-    text.trim().parse::<f64>().ok()
-}
-
-fn try_extract_at(path: &Path, seek_seconds: &str) -> Option<image::RgbaImage> {
-    let output = Command::new("ffmpeg")
-        .args([
-            "-ss",
-            seek_seconds,
-            "-i",
-        ])
-        .arg(path)
-        .args([
-            "-frames:v",
-            "1",
-            "-vf",
-            &format!("scale={THUMB_WIDTH}:{THUMB_HEIGHT}:force_original_aspect_ratio=decrease,pad={THUMB_WIDTH}:{THUMB_HEIGHT}:(ow-iw)/2:(oh-ih)/2"),
-            "-f",
-            "rawvideo",
-            "-pix_fmt",
-            "rgba",
-            "pipe:1",
-        ])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .output()
-        .ok()?;
-
-    if !output.status.success() || output.stdout.len() != EXPECTED_BYTES {
-        return None;
-    }
-
-    image::RgbaImage::from_raw(THUMB_WIDTH, THUMB_HEIGHT, output.stdout)
+pub fn extract_frame_at_time(path: &Path, time_seconds: f64) -> Option<image::RgbaImage> {
+    let mut decoder = VideoDecoder::open(path).ok()?;
+    decoder.seek_and_decode(time_seconds, PREVIEW_WIDTH, PREVIEW_HEIGHT)
 }

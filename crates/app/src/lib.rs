@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 use std::sync::mpsc;
-use std::time::{Duration, Instant};
 
 use wizard_audio::output::AudioOutput;
 use wizard_media::metadata::MediaMetadata;
@@ -47,6 +47,11 @@ enum AudioPreviewRequest {
         time_seconds: f64,
         sample_rate_hz: u32,
     },
+    StartStream {
+        path: std::path::PathBuf,
+        start_seconds: f64,
+        sample_rate_hz: u32,
+    },
 }
 
 struct AudioSnippet {
@@ -60,6 +65,7 @@ pub struct TextureCache {
     pub pending_thumbnails: HashSet<ClipId>,
     pub preview_requested: HashSet<ClipId>,
     pub waveforms: HashMap<ClipId, Vec<(f32, f32)>>,
+    pub playback_texture: Option<egui::TextureHandle>,
 }
 
 impl wizard_ui::browser::TextureLookup for TextureCache {
@@ -77,6 +83,10 @@ impl wizard_ui::browser::TextureLookup for TextureCache {
 
     fn waveform_peaks(&self, id: &ClipId) -> Option<&Vec<(f32, f32)>> {
         self.waveforms.get(id)
+    }
+
+    fn playback_frame(&self) -> Option<&egui::TextureHandle> {
+        self.playback_texture.as_ref()
     }
 }
 
@@ -96,11 +106,30 @@ pub struct EditorApp {
     last_audio_request: Option<(ClipId, i64)>,
     waveform_tx: mpsc::Sender<(ClipId, Vec<(f32, f32)>)>,
     waveform_rx: mpsc::Receiver<(ClipId, Vec<(f32, f32)>)>,
+    playback_frame_req_tx: mpsc::Sender<(ClipId, std::path::PathBuf, f64)>,
+    playback_frame_rx: mpsc::Receiver<(ClipId, f64, image::RgbaImage)>,
+    last_playback_frame_request: Option<f64>,
+    playback_audio_clip: Option<ClipId>,
+    no_audio_paths: Arc<Mutex<HashSet<std::path::PathBuf>>>,
 }
 
 impl EditorApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         wizard_ui::theme::apply_theme(&cc.egui_ctx);
+
+        if let Some(render_state) = &cc.wgpu_render_state {
+            let renderer = wizard_ui::waveform_gpu::WaveformRenderer::new(
+                &render_state.device,
+                render_state.target_format,
+            );
+            render_state
+                .renderer
+                .write()
+                .callback_resources
+                .insert(renderer);
+            cc.egui_ctx
+                .data_mut(|d| d.insert_temp(egui::Id::new("gpu_waveforms"), true));
+        }
         let (thumb_tx, thumb_rx) = mpsc::channel();
         let (meta_tx, meta_rx) = mpsc::channel();
         let (preview_result_tx, preview_rx) = mpsc::channel();
@@ -135,43 +164,217 @@ impl EditorApp {
 
         let (waveform_tx, waveform_rx) = mpsc::channel::<(ClipId, Vec<(f32, f32)>)>();
 
+        let (playback_frame_req_tx, playback_frame_req_rx) =
+            mpsc::channel::<(ClipId, std::path::PathBuf, f64)>();
+        let (playback_frame_result_tx, playback_frame_rx) =
+            mpsc::channel::<(ClipId, f64, image::RgbaImage)>();
+
+        std::thread::spawn(move || {
+            let mut cached_decoder: Option<(
+                std::path::PathBuf,
+                wizard_media::decoder::VideoDecoder,
+            )> = None;
+            loop {
+                let Ok(mut req) = playback_frame_req_rx.recv() else {
+                    return;
+                };
+                while let Ok(next) = playback_frame_req_rx.try_recv() {
+                    req = next;
+                }
+                let (clip_id, path, time) = req;
+
+                let needs_new = cached_decoder.as_ref().is_none_or(|(p, _)| p != &path);
+
+                if needs_new {
+                    cached_decoder = wizard_media::decoder::VideoDecoder::open(&path)
+                        .ok()
+                        .map(|d| (path.clone(), d));
+                }
+
+                if let Some((_, ref mut decoder)) = cached_decoder {
+                    let can_sequential = decoder.last_decode_time().is_some_and(|last| {
+                        let diff = time - last;
+                        diff > 0.0 && diff < 0.5
+                    });
+
+                    let img = if can_sequential {
+                        decoder.decode_next_frame(960, 540)
+                    } else {
+                        decoder.seek_and_decode(time, 960, 540)
+                    };
+
+                    if let Some(img) = img {
+                        let _ = playback_frame_result_tx.send((clip_id, time, img));
+                    }
+                }
+            }
+        });
+
         let audio_output = AudioOutput::new().ok();
         let (audio_req_tx, audio_req_rx) = mpsc::channel();
         let (audio_snippet_tx, audio_snippet_rx) = mpsc::channel();
 
+        let no_audio_paths: Arc<Mutex<HashSet<std::path::PathBuf>>> =
+            Arc::new(Mutex::new(HashSet::new()));
+        let no_audio_paths_for_thread = no_audio_paths.clone();
+
         std::thread::spawn(move || {
-            let mut last_decode_started_at = Instant::now() - Duration::from_secs(1);
+            let mut cached_decoder: Option<(
+                std::path::PathBuf,
+                wizard_media::decoder::AudioDecoder,
+            )> = None;
+
+            let open_decoder = |path: &std::path::Path,
+                                no_audio: &Arc<Mutex<HashSet<std::path::PathBuf>>>|
+             -> Option<wizard_media::decoder::AudioDecoder> {
+                match wizard_media::decoder::AudioDecoder::open(path) {
+                    Ok(d) => Some(d),
+                    Err(_err) => {
+                        if let Ok(streams) = wizard_media::decoder::probe_streams(path) {
+                            let has_audio_stream = streams.iter().any(|s| s.medium == "Audio");
+                            if !has_audio_stream {
+                                if let Ok(mut set) = no_audio.lock() {
+                                    set.insert(path.to_path_buf());
+                                }
+                            }
+                        }
+                        None
+                    }
+                }
+            };
+
+            let ensure_decoder =
+                |cached: &mut Option<(std::path::PathBuf, wizard_media::decoder::AudioDecoder)>,
+                 path: &std::path::Path,
+                 no_audio: &Arc<Mutex<HashSet<std::path::PathBuf>>>| {
+                    let needs_new = cached.as_ref().is_none_or(|(p, _)| p != path);
+                    if needs_new {
+                        *cached = open_decoder(path, no_audio)
+                            .map(|d| (path.to_path_buf(), d));
+                    }
+                };
+
             loop {
-                let Ok(mut req) = audio_req_rx.recv() else {
+                let Ok(req) = audio_req_rx.recv() else {
                     return;
                 };
-                while let Ok(next) = audio_req_rx.try_recv() {
-                    req = next;
-                }
 
                 match req {
-                    AudioPreviewRequest::Stop => {}
+                    AudioPreviewRequest::Stop => {
+                        while audio_req_rx.try_recv().is_ok() {}
+                    }
                     AudioPreviewRequest::Preview {
                         path,
                         time_seconds,
                         sample_rate_hz,
-                        ..
                     } => {
-                        let min_interval = Duration::from_millis(80);
-                        if last_decode_started_at.elapsed() < min_interval {
+                        if no_audio_paths_for_thread
+                            .lock()
+                            .map(|set| set.contains(&path))
+                            .unwrap_or(false)
+                        {
                             continue;
                         }
-                        last_decode_started_at = Instant::now();
 
-                        let snippet_duration = 0.35;
-                        let start_seconds = (time_seconds - 0.15).max(0.0);
-                        let samples_mono = wizard_media::audio::decode_pcm_snippet_f32_mono(
+                        ensure_decoder(
+                            &mut cached_decoder,
                             &path,
-                            start_seconds,
-                            snippet_duration,
-                            sample_rate_hz,
+                            &no_audio_paths_for_thread,
                         );
-                        let _ = audio_snippet_tx.send(AudioSnippet { samples_mono });
+
+                        if let Some((_, ref mut decoder)) = cached_decoder {
+                            let samples = decoder.decode_range_mono_f32(
+                                time_seconds.max(0.0),
+                                0.5,
+                                sample_rate_hz,
+                            );
+                            let _ = audio_snippet_tx.send(AudioSnippet {
+                                samples_mono: samples,
+                            });
+                        }
+                    }
+                    AudioPreviewRequest::StartStream {
+                        path,
+                        start_seconds,
+                        sample_rate_hz,
+                    } => {
+                        if no_audio_paths_for_thread
+                            .lock()
+                            .map(|set| set.contains(&path))
+                            .unwrap_or(false)
+                        {
+                            continue;
+                        }
+
+                        ensure_decoder(
+                            &mut cached_decoder,
+                            &path,
+                            &no_audio_paths_for_thread,
+                        );
+
+                        if let Some((_, ref mut decoder)) = cached_decoder {
+                            decoder.seek_to(start_seconds);
+                        }
+
+                        let mut streaming_rate = sample_rate_hz;
+                        loop {
+                            let chunk = match cached_decoder {
+                                Some((_, ref mut decoder)) => {
+                                    decoder.decode_chunk_mono_f32(0.5, streaming_rate)
+                                }
+                                None => break,
+                            };
+                            if chunk.is_empty() {
+                                break;
+                            }
+                            let _ = audio_snippet_tx.send(AudioSnippet {
+                                samples_mono: chunk,
+                            });
+
+                            match audio_req_rx.try_recv() {
+                                Ok(AudioPreviewRequest::Stop) => {
+                                    while audio_req_rx.try_recv().is_ok() {}
+                                    break;
+                                }
+                                Ok(AudioPreviewRequest::StartStream {
+                                    path: new_path,
+                                    start_seconds: new_start,
+                                    sample_rate_hz: new_rate,
+                                }) => {
+                                    ensure_decoder(
+                                        &mut cached_decoder,
+                                        &new_path,
+                                        &no_audio_paths_for_thread,
+                                    );
+                                    if let Some((_, ref mut dec)) = cached_decoder {
+                                        dec.seek_to(new_start);
+                                        streaming_rate = new_rate;
+                                    } else {
+                                        break;
+                                    }
+                                }
+                                Ok(AudioPreviewRequest::Preview {
+                                    path: p,
+                                    time_seconds: t,
+                                    sample_rate_hz: sr,
+                                }) => {
+                                    ensure_decoder(
+                                        &mut cached_decoder,
+                                        &p,
+                                        &no_audio_paths_for_thread,
+                                    );
+                                    if let Some((_, ref mut dec)) = cached_decoder {
+                                        let samples =
+                                            dec.decode_range_mono_f32(t.max(0.0), 0.5, sr);
+                                        let _ = audio_snippet_tx.send(AudioSnippet {
+                                            samples_mono: samples,
+                                        });
+                                    }
+                                    break;
+                                }
+                                Err(_) => {}
+                            }
+                        }
                     }
                 }
             }
@@ -193,6 +396,11 @@ impl EditorApp {
             last_audio_request: None,
             waveform_tx,
             waveform_rx,
+            playback_frame_req_tx,
+            playback_frame_rx,
+            last_playback_frame_request: None,
+            playback_audio_clip: None,
+            no_audio_paths,
         }
     }
 
@@ -252,9 +460,25 @@ impl EditorApp {
             received = true;
         }
 
+        while let Ok((_clip_id, _time, img)) = self.playback_frame_rx.try_recv() {
+            let texture = ctx.load_texture(
+                "playback_frame",
+                egui::ColorImage::from_rgba_unmultiplied(
+                    [img.width() as usize, img.height() as usize],
+                    img.as_raw(),
+                ),
+                egui::TextureOptions::LINEAR,
+            );
+            self.textures.playback_texture = Some(texture);
+            received = true;
+        }
+
         while let Ok(snippet) = self.audio_snippet_rx.try_recv() {
             if let Some(out) = &self.audio_output {
-                out.clear();
+                let is_playing = self.state.project.playback.state == PlaybackState::Playing;
+                if !is_playing {
+                    out.clear();
+                }
                 out.enqueue_mono_samples(&snippet.samples_mono);
             }
         }
@@ -312,8 +536,11 @@ impl EditorApp {
             return;
         };
 
+        let is_playing = self.state.project.playback.state == PlaybackState::Playing;
+
         let Some(clip_id) = self.state.ui.selection.hovered_clip else {
-            if self.state.ui.timeline_scrubbing.is_none()
+            if !is_playing
+                && self.state.ui.timeline_scrubbing.is_none()
                 && self.last_audio_request.take().is_some()
             {
                 out.clear();
@@ -323,7 +550,8 @@ impl EditorApp {
         };
 
         let Some(t_norm) = self.state.ui.hovered_scrub_t else {
-            if self.state.ui.timeline_scrubbing.is_none()
+            if !is_playing
+                && self.state.ui.timeline_scrubbing.is_none()
                 && self.last_audio_request.take().is_some()
             {
                 out.clear();
@@ -335,6 +563,14 @@ impl EditorApp {
         let Some(clip) = self.state.project.clips.get(&clip_id) else {
             return;
         };
+        if self
+            .no_audio_paths
+            .lock()
+            .map(|set| set.contains(&clip.path))
+            .unwrap_or(false)
+        {
+            return;
+        }
         let Some(duration) = clip.duration else {
             return;
         };
@@ -370,20 +606,11 @@ impl EditorApp {
         let mut found_path = None;
         let mut found_time = 0.0;
 
-        for track in &self.state.project.tracks {
-            for tc in &track.clips {
-                if time >= tc.position && time < tc.position + tc.duration {
-                    let clip_time = tc.in_point + (time - tc.position);
-                    if let Some(clip) = self.state.project.clips.get(&tc.clip_id) {
-                        found_clip_id = Some(tc.clip_id);
-                        found_path = Some(clip.path.clone());
-                        found_time = clip_time;
-                        break;
-                    }
-                }
-            }
-            if found_clip_id.is_some() {
-                break;
+        if let Some(hit) = self.state.project.timeline.audio_clip_at_time(time) {
+            if let Some(clip) = self.state.project.clips.get(&hit.clip.source_id) {
+                found_clip_id = Some(hit.clip.source_id);
+                found_path = Some(clip.path.clone());
+                found_time = hit.source_time;
             }
         }
 
@@ -393,6 +620,14 @@ impl EditorApp {
         let Some(path) = found_path else {
             return;
         };
+        if self
+            .no_audio_paths
+            .lock()
+            .map(|set| set.contains(&path))
+            .unwrap_or(false)
+        {
+            return;
+        }
 
         let bucket = (found_time * 10.0).round() as i64;
         if self.last_audio_request == Some((clip_id, bucket)) {
@@ -405,6 +640,96 @@ impl EditorApp {
             time_seconds: found_time,
             sample_rate_hz: out.sample_rate_hz(),
         });
+    }
+
+    fn update_playback_audio(&mut self) {
+        let Some(out) = &self.audio_output else {
+            return;
+        };
+
+        if self.state.project.playback.state != PlaybackState::Playing {
+            if self.playback_audio_clip.is_some() {
+                out.clear();
+                let _ = self.audio_req_tx.send(AudioPreviewRequest::Stop);
+                self.playback_audio_clip = None;
+            }
+            return;
+        }
+
+        if self.state.ui.selection.hovered_clip.is_some() {
+            return;
+        }
+
+        let playhead = self.state.project.playback.playhead;
+
+        let hit = self.state.project.timeline.audio_clip_at_time(playhead);
+        let Some(hit) = hit else {
+            if self.playback_audio_clip.is_some() {
+                out.clear();
+                let _ = self.audio_req_tx.send(AudioPreviewRequest::Stop);
+                self.playback_audio_clip = None;
+            }
+            return;
+        };
+
+        let clip_id = hit.clip.source_id;
+        let source_time = hit.source_time;
+
+        let Some(clip) = self.state.project.clips.get(&clip_id) else {
+            return;
+        };
+        if self
+            .no_audio_paths
+            .lock()
+            .map(|set| set.contains(&clip.path))
+            .unwrap_or(false)
+        {
+            return;
+        }
+
+        if self.playback_audio_clip != Some(clip_id) {
+            out.clear();
+            self.playback_audio_clip = Some(clip_id);
+            let _ = self.audio_req_tx.send(AudioPreviewRequest::StartStream {
+                path: clip.path.clone(),
+                start_seconds: source_time,
+                sample_rate_hz: out.sample_rate_hz(),
+            });
+        }
+    }
+
+    fn update_playback_frame(&mut self) {
+        let playhead = self.state.project.playback.playhead;
+        let is_playing = self.state.project.playback.state != PlaybackState::Stopped;
+        let is_scrubbing = self.state.ui.timeline_scrubbing.is_some();
+
+        if !is_playing && !is_scrubbing {
+            return;
+        }
+
+        let threshold = 0.02;
+        if let Some(last) = self.last_playback_frame_request {
+            if (playhead - last).abs() < threshold {
+                return;
+            }
+        }
+
+        let time = if is_scrubbing {
+            self.state.ui.timeline_scrubbing.unwrap_or(playhead)
+        } else {
+            playhead
+        };
+
+        if let Some(hit) = self.state.project.timeline.clip_at_time(time) {
+            if let Some(clip) = self.state.project.clips.get(&hit.clip.source_id) {
+                self.last_playback_frame_request = Some(playhead);
+                let _ = self.playback_frame_req_tx.send((
+                    hit.clip.source_id,
+                    clip.path.clone(),
+                    hit.source_time,
+                ));
+            }
+        }
     }
 
     fn import_folder(&mut self, path: std::path::PathBuf) {
@@ -440,7 +765,8 @@ impl eframe::App for EditorApp {
         let now = ctx.input(|i| i.time);
         if let Some(last) = self.last_frame_time {
             let dt = now - last;
-            self.state.project.playback.advance(dt);
+            let duration = self.state.project.timeline.timeline_duration();
+            self.state.project.playback.advance(dt, duration);
             if dt > 0.0 {
                 let inst_fps = (1.0 / dt) as f32;
                 if self.state.ui.fps <= 0.0 {
@@ -504,6 +830,8 @@ impl eframe::App for EditorApp {
         self.enqueue_visible_previews();
         self.update_hover_audio();
         self.update_timeline_scrub_audio();
+        self.update_playback_audio();
+        self.update_playback_frame();
 
         egui::TopBottomPanel::bottom("timeline_panel")
             .resizable(true)

@@ -8,17 +8,46 @@ use crate::theme;
 pub fn preview_panel(ui: &mut egui::Ui, state: &AppState, textures: &dyn TextureLookup) {
     let available = ui.available_size();
 
+    let is_active = state.project.playback.state != PlaybackState::Stopped
+        || state.ui.timeline_scrubbing.is_some();
+
+    if is_active {
+        if let Some(tex) = textures.playback_frame() {
+            show_frame_texture(ui, tex, available);
+        } else if let Some(clip_id) = state.ui.selection.selected_clip {
+            if let Some(tex) = textures.thumbnail(&clip_id) {
+                show_frame_texture(ui, tex, available);
+            }
+        }
+
+        ui.vertical_centered(|ui| {
+            let playhead = state.project.playback.playhead;
+            let total_secs = playhead;
+            let minutes = (total_secs / 60.0).floor() as i32;
+            let secs = total_secs % 60.0;
+            let frames = ((secs.fract()) * 24.0).floor() as i32;
+            let status = match state.project.playback.state {
+                PlaybackState::Stopped => "Scrub",
+                PlaybackState::Playing => "Play",
+                PlaybackState::PlayingReverse => "Rev",
+            };
+            ui.colored_label(
+                theme::TEXT_DIM,
+                format!(
+                    "{minutes}:{:02}.{frames:02}  |  {status}",
+                    secs.floor() as i32
+                ),
+            );
+        });
+        return;
+    }
+
     match state.ui.selection.selected_clip {
         Some(clip_id) => {
             if let Some(clip) = state.project.clips.get(&clip_id) {
                 ui.vertical_centered(|ui| {
                     if let Some(tex) = textures.thumbnail(&clip_id) {
-                        let tex_size = tex.size_vec2();
-                        let scale = (available.x / tex_size.x)
-                            .min(available.y / tex_size.y)
-                            .min(1.0);
-                        let display_size = tex_size * scale;
-                        ui.image(egui::load::SizedTexture::new(tex.id(), display_size));
+                        show_frame_texture(ui, tex, available);
                     } else {
                         let preview_rect = egui::Rect::from_center_size(
                             ui.available_rect_before_wrap().center(),
@@ -71,4 +100,15 @@ pub fn preview_panel(ui: &mut egui::Ui, state: &AppState, textures: &dyn Texture
             });
         }
     }
+}
+
+fn show_frame_texture(ui: &mut egui::Ui, tex: &egui::TextureHandle, available: egui::Vec2) {
+    let tex_size = tex.size_vec2();
+    let scale = (available.x / tex_size.x)
+        .min((available.y - 30.0) / tex_size.y)
+        .min(1.0);
+    let display_size = tex_size * scale;
+    ui.vertical_centered(|ui| {
+        ui.image(egui::load::SizedTexture::new(tex.id(), display_size));
+    });
 }

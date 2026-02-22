@@ -3,3 +3,4 @@ pub mod constants;
 pub mod preview;
 pub mod theme;
 pub mod timeline;
+pub mod waveform_gpu;
