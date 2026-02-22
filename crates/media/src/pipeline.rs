@@ -70,6 +70,7 @@ pub struct PipelineHandle {
     frame_rx: Option<mpsc::Receiver<DecodedFrame>>,
     stop_tx: Option<mpsc::Sender<()>>,
     speed_tx: mpsc::Sender<f64>,
+    clock_reset_tx: mpsc::Sender<()>,
     _demuxer_handle: Option<JoinHandle<()>>,
     _video_handle: Option<JoinHandle<()>>,
     _audio_handle: Option<JoinHandle<()>>,
@@ -96,7 +97,11 @@ impl PipelineHandle {
         let audio_stream = format_ctx.streams().best(Type::Audio);
 
         let video_stream_index = video_stream.as_ref().map(|s| s.index());
-        let audio_stream_index = audio_stream.as_ref().map(|s| s.index());
+        let audio_stream_index = if audio_producer.is_some() {
+            audio_stream.as_ref().map(|s| s.index())
+        } else {
+            None
+        };
 
         let has_video = video_stream.is_some();
         let has_audio = audio_stream.is_some();
@@ -114,6 +119,7 @@ impl PipelineHandle {
 
         let (stop_tx, stop_rx) = mpsc::channel::<()>();
         let (speed_tx, speed_rx) = mpsc::channel::<f64>();
+        let (clock_reset_tx, clock_reset_rx) = mpsc::channel::<()>();
         let (video_packet_tx, video_packet_rx) = mpsc::sync_channel::<ffmpeg::Packet>(128);
         let (audio_packet_tx, audio_packet_rx) = mpsc::sync_channel::<ffmpeg::Packet>(128);
         let (frame_tx, frame_rx) = mpsc::sync_channel::<DecodedFrame>(4);
@@ -139,6 +145,7 @@ impl PipelineHandle {
                 target_w,
                 target_h,
                 speed_rx,
+                clock_reset_rx,
                 speed,
             ))
         } else {
@@ -168,6 +175,7 @@ impl PipelineHandle {
             frame_rx: Some(frame_rx),
             stop_tx: Some(stop_tx),
             speed_tx,
+            clock_reset_tx,
             _demuxer_handle: Some(demuxer_handle),
             _video_handle: video_handle,
             _audio_handle: audio_handle,
@@ -180,6 +188,10 @@ impl PipelineHandle {
 
     pub fn update_speed(&self, speed: f64) {
         let _ = self.speed_tx.send(speed);
+    }
+
+    pub fn reset_clock(&self) {
+        let _ = self.clock_reset_tx.send(());
     }
 
     pub fn stop(mut self) {
@@ -260,6 +272,7 @@ fn spawn_video_decoder(
     target_w: u32,
     target_h: u32,
     speed_rx: mpsc::Receiver<f64>,
+    clock_reset_rx: mpsc::Receiver<()>,
     initial_speed: f64,
 ) -> JoinHandle<()> {
     std::thread::Builder::new()
@@ -293,15 +306,19 @@ fn spawn_video_decoder(
                  skipping: &mut bool,
                  frame_tx: &mpsc::SyncSender<DecodedFrame>,
                  time_base: f64,
-                 speed_rx: &mpsc::Receiver<f64>|
+                 speed_rx: &mpsc::Receiver<f64>,
+                 clock_reset_rx: &mpsc::Receiver<()>|
                  -> bool {
                     while let Ok(s) = speed_rx.try_recv() {
                         clock.set_speed(s);
                     }
                     let pts = frame.pts().map(|p| p as f64 * time_base).unwrap_or(0.0);
+                    if clock_reset_rx.try_recv().is_ok() {
+                        clock.reset(pts);
+                    }
 
                     if *skipping {
-                        if pts < skip_before - 0.05 {
+                        if pts < skip_before - 0.02 {
                             return true;
                         }
                         *skipping = false;
@@ -340,6 +357,7 @@ fn spawn_video_decoder(
                             &frame_tx,
                             time_base,
                             &speed_rx,
+                            &clock_reset_rx,
                         ) {
                             return;
                         }
@@ -360,6 +378,7 @@ fn spawn_video_decoder(
                         &frame_tx,
                         time_base,
                         &speed_rx,
+                        &clock_reset_rx,
                     ) {
                         return;
                     }
@@ -613,7 +632,7 @@ fn spawn_audio_decoder(
                 dst_rate,
             );
 
-            let muted = (speed - 1.0).abs() > 0.01;
+            let muted = speed < 0.99;
 
             let Ok(mut resampler) = resampler else {
                 if muted {
@@ -645,7 +664,7 @@ fn spawn_audio_decoder(
 
             let mut decoded = ffmpeg::util::frame::Audio::empty();
             let mut resampled = ffmpeg::util::frame::Audio::empty();
-            let mut clock = StreamClock::new(1.0);
+            let mut clock = StreamClock::new(speed);
             let mut skipping = skip_before > 0.01;
             let mut estimated_next_pts: Option<f64> = None;
 
@@ -680,7 +699,7 @@ fn spawn_audio_decoder(
                     estimated_next_pts = Some(frame_pts + frame_duration);
 
                     if skipping {
-                        if frame_pts + frame_duration < skip_before - 0.05 {
+                        if frame_pts + frame_duration < skip_before - 0.02 {
                             continue;
                         }
                         skipping = false;
@@ -698,6 +717,111 @@ fn spawn_audio_decoder(
             }
         })
         .expect("failed to spawn audio decoder thread")
+}
+
+pub struct AudioOnlyHandle {
+    stop_tx: Option<mpsc::Sender<()>>,
+    _demuxer: Option<JoinHandle<()>>,
+    _decoder: Option<JoinHandle<()>>,
+}
+
+impl AudioOnlyHandle {
+    #[allow(clippy::too_many_arguments)]
+    pub fn start(
+        path: &Path,
+        start_time: f64,
+        audio_producer: Arc<Mutex<AudioProducer>>,
+        sample_rate: u32,
+        channels: u16,
+        speed: f64,
+    ) -> Result<Self, String> {
+        init_once();
+
+        let format_ctx =
+            ffmpeg::format::input(path).map_err(|e| format!("Failed to open {path:?}: {e}"))?;
+
+        let audio_stream = format_ctx
+            .streams()
+            .best(Type::Audio)
+            .ok_or_else(|| "No audio stream found".to_string())?;
+
+        let audio_stream_index = audio_stream.index();
+        let audio_time_base = {
+            let tb = audio_stream.time_base();
+            tb.numerator() as f64 / tb.denominator() as f64
+        };
+
+        drop(format_ctx);
+
+        let (stop_tx, stop_rx) = mpsc::channel::<()>();
+        let (audio_packet_tx, audio_packet_rx) = mpsc::sync_channel::<ffmpeg::Packet>(128);
+
+        let path_owned = path.to_path_buf();
+        let path_for_decoder = path_owned.clone();
+
+        let demuxer = std::thread::Builder::new()
+            .name("audio-only-demuxer".into())
+            .spawn(move || {
+                let Ok(mut format_ctx) = ffmpeg::format::input(&path_owned) else {
+                    return;
+                };
+
+                if start_time > 0.01 {
+                    let ts = (start_time * 1_000_000.0) as i64;
+                    let _ = format_ctx.seek(ts, ..);
+                }
+
+                loop {
+                    match stop_rx.try_recv() {
+                        Ok(_) | Err(mpsc::TryRecvError::Disconnected) => return,
+                        Err(mpsc::TryRecvError::Empty) => {}
+                    }
+
+                    let mut packet = ffmpeg::Packet::empty();
+                    match packet.read(&mut format_ctx) {
+                        Ok(_) => {}
+                        Err(ffmpeg::Error::Eof) => return,
+                        Err(_) => return,
+                    }
+
+                    if packet.stream() == audio_stream_index
+                        && audio_packet_tx.send(packet).is_err()
+                    {
+                        return;
+                    }
+                }
+            })
+            .map_err(|e| format!("Failed to spawn audio-only demuxer: {e}"))?;
+
+        let decoder_handle = spawn_audio_decoder(
+            audio_packet_rx,
+            audio_producer,
+            path_for_decoder,
+            start_time,
+            audio_time_base,
+            sample_rate,
+            channels,
+            speed,
+        );
+
+        Ok(Self {
+            stop_tx: Some(stop_tx),
+            _demuxer: Some(demuxer),
+            _decoder: Some(decoder_handle),
+        })
+    }
+
+    fn signal_stop(&mut self) {
+        if let Some(tx) = self.stop_tx.take() {
+            let _ = tx.send(());
+        }
+    }
+}
+
+impl Drop for AudioOnlyHandle {
+    fn drop(&mut self) {
+        self.signal_stop();
+    }
 }
 
 fn push_resampled_f32(

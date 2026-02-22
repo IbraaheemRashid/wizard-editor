@@ -1,3 +1,5 @@
+use std::sync::{Arc, Mutex};
+
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, Sample, SampleFormat};
 use ringbuf::traits::{Consumer, Producer, Split};
@@ -10,6 +12,7 @@ pub struct AudioOutput {
     _stream: cpal::Stream,
     sample_rate_hz: u32,
     channels: u16,
+    consumer_slot: Arc<Mutex<AudioConsumer>>,
 }
 
 impl AudioOutput {
@@ -31,14 +34,22 @@ impl AudioOutput {
         let rb = HeapRb::<f32>::new(sample_rate_hz as usize / 4);
         let (producer, consumer) = rb.split();
 
+        let consumer_slot = Arc::new(Mutex::new(consumer));
+
         let err_fn = |err| {
             eprintln!("audio stream error: {err}");
         };
 
         let stream = match sample_format {
-            SampleFormat::F32 => build_stream::<f32>(device, &config, consumer, err_fn)?,
-            SampleFormat::I16 => build_stream::<i16>(device, &config, consumer, err_fn)?,
-            SampleFormat::U16 => build_stream::<u16>(device, &config, consumer, err_fn)?,
+            SampleFormat::F32 => {
+                build_stream::<f32>(device, &config, consumer_slot.clone(), err_fn)?
+            }
+            SampleFormat::I16 => {
+                build_stream::<i16>(device, &config, consumer_slot.clone(), err_fn)?
+            }
+            SampleFormat::U16 => {
+                build_stream::<u16>(device, &config, consumer_slot.clone(), err_fn)?
+            }
             other => return Err(format!("Unsupported sample format: {other}")),
         };
 
@@ -51,6 +62,7 @@ impl AudioOutput {
                 _stream: stream,
                 sample_rate_hz,
                 channels,
+                consumer_slot,
             },
             producer,
         ))
@@ -62,6 +74,21 @@ impl AudioOutput {
 
     pub fn channels(&self) -> u16 {
         self.channels
+    }
+
+    pub fn swap_buffer(&self) -> AudioProducer {
+        let rb = HeapRb::<f32>::new(self.sample_rate_hz as usize / 4);
+        let (producer, consumer) = rb.split();
+        if let Ok(mut slot) = self.consumer_slot.lock() {
+            *slot = consumer;
+        }
+        producer
+    }
+
+    pub fn swap_consumer(&self, consumer: AudioConsumer) {
+        if let Ok(mut slot) = self.consumer_slot.lock() {
+            *slot = consumer;
+        }
     }
 }
 
@@ -84,7 +111,7 @@ pub fn enqueue_samples(producer: &mut AudioProducer, samples: &[f32], channels: 
 fn build_stream<T>(
     device: cpal::Device,
     config: &cpal::StreamConfig,
-    mut consumer: AudioConsumer,
+    consumer_slot: Arc<Mutex<AudioConsumer>>,
     err_fn: impl FnMut(cpal::StreamError) + Send + 'static,
 ) -> Result<cpal::Stream, String>
 where
@@ -94,9 +121,15 @@ where
         .build_output_stream(
             config,
             move |data: &mut [T], _| {
-                for sample in data.iter_mut() {
-                    let s = consumer.try_pop().unwrap_or(0.0);
-                    *sample = T::from_sample(s);
+                if let Ok(mut consumer) = consumer_slot.try_lock() {
+                    for sample in data.iter_mut() {
+                        let s = consumer.try_pop().unwrap_or(0.0);
+                        *sample = T::from_sample(s);
+                    }
+                } else {
+                    for sample in data.iter_mut() {
+                        *sample = T::from_sample(0.0);
+                    }
                 }
             },
             err_fn,

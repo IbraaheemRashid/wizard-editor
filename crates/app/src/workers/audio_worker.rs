@@ -80,11 +80,12 @@ pub fn spawn_audio_worker(no_audio_paths: Arc<Mutex<HashSet<PathBuf>>>) -> Audio
                     ensure_decoder(&mut cached_decoder, &path, &no_audio_paths);
 
                     if let Some((_, ref mut decoder)) = cached_decoder {
-                        let samples = decoder.decode_range_mono_f32(
+                        let mut samples = decoder.decode_range_mono_f32(
                             time_seconds.max(0.0),
-                            0.5,
+                            1.0,
                             sample_rate_hz,
                         );
+                        apply_fade(&mut samples, sample_rate_hz);
                         let _ = snippet_tx.send(AudioSnippet {
                             samples_mono: samples,
                         });
@@ -95,4 +96,20 @@ pub fn spawn_audio_worker(no_audio_paths: Arc<Mutex<HashSet<PathBuf>>>) -> Audio
     });
 
     AudioWorkerChannels { req_tx, snippet_rx }
+}
+
+fn apply_fade(samples: &mut [f32], sample_rate: u32) {
+    let fade_samples = ((sample_rate as f32 * 0.01) as usize).max(1);
+    let len = samples.len();
+    if len == 0 {
+        return;
+    }
+    let fade_in = fade_samples.min(len / 2);
+    let fade_out = fade_samples.min(len / 2);
+    for (i, sample) in samples[..fade_in].iter_mut().enumerate() {
+        *sample *= i as f32 / fade_in as f32;
+    }
+    for i in 0..fade_out {
+        samples[len - 1 - i] *= i as f32 / fade_out as f32;
+    }
 }

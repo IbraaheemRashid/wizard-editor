@@ -8,12 +8,13 @@ use crate::waveform_gpu::waveform_paint_callback;
 use crate::TextureLookup;
 
 const TRACK_HEIGHT: f32 = 60.0;
-const TRACK_HEADER_WIDTH: f32 = 60.0;
+const TRACK_HEADER_WIDTH: f32 = 70.0;
 const RULER_HEIGHT: f32 = 24.0;
 const SCROLLBAR_HEIGHT: f32 = 12.0;
+const V_SCROLLBAR_WIDTH: f32 = 10.0;
 const ZOOM_MIN: f32 = 20.0;
 const ZOOM_MAX: f32 = 500.0;
-const SNAP_THRESHOLD_PX: f32 = 5.0;
+const SNAP_THRESHOLD_PX: f32 = 10.0;
 const THUMB_WIDTH: f32 = 50.0;
 const TRIM_HANDLE_WIDTH: f32 = 12.0;
 const MIN_CLIP_DURATION: f64 = 0.1;
@@ -127,37 +128,41 @@ pub fn timeline_panel(ui: &mut egui::Ui, state: &mut AppState, textures: &dyn Te
     let pps = state.ui.timeline.zoom;
     let scroll = state.ui.timeline.scroll_offset;
     let v_scroll = state.ui.timeline.vertical_scroll_offset;
-    let centered_block_offset = if needs_vertical_scroll {
+    let ruler_top = timeline_rect.min.y;
+
+    draw_ruler(ui, content_left, ruler_top, content_width, pps, scroll);
+
+    let clip_area_top = ruler_top + RULER_HEIGHT;
+    let clip_area_bottom = timeline_rect.max.y - SCROLLBAR_HEIGHT - 8.0;
+    let available_track_area = clip_area_bottom - clip_area_top;
+
+    let centered_offset = if needs_vertical_scroll {
         0.0
     } else {
-        (available_track_height - total_track_height).max(0.0) * 0.5
+        (available_track_area - total_track_height).max(0.0) * 0.5
     };
-    let ruler_top = timeline_rect.min.y + centered_block_offset;
 
-    draw_ruler(
-        ui,
-        content_left,
-        ruler_top,
-        content_width,
-        pps,
-        scroll,
-    );
-
-    let tracks_top = ruler_top + RULER_HEIGHT - v_scroll;
+    let tracks_top = clip_area_top + centered_offset - v_scroll;
 
     let mut pending_browser_drop: Option<(ClipId, TrackId, f64)> = None;
 
-    let clip_area_top = ruler_top + RULER_HEIGHT;
-    let clip_area_bottom = if needs_vertical_scroll {
-        (clip_area_top + available_track_height).min(timeline_rect.max.y - SCROLLBAR_HEIGHT - 8.0)
-    } else {
-        timeline_rect.max.y - SCROLLBAR_HEIGHT - 8.0
-    };
     let content_clip_rect = Rect::from_min_max(
         pos2(content_left, clip_area_top),
         pos2(content_left + content_width, clip_area_bottom),
     );
     let content_painter = ui.painter().with_clip_rect(content_clip_rect);
+
+    let header_clip_rect = Rect::from_min_max(
+        pos2(timeline_rect.min.x, clip_area_top),
+        pos2(content_left, clip_area_bottom),
+    );
+    let header_painter = ui.painter().with_clip_rect(header_clip_rect);
+
+    let full_track_clip_rect = Rect::from_min_max(
+        pos2(timeline_rect.min.x, clip_area_top),
+        pos2(timeline_rect.max.x, clip_area_bottom),
+    );
+    let track_row_painter = ui.painter().with_clip_rect(full_track_clip_rect);
 
     let screen_size = ui.ctx().screen_rect().size();
     let gpu_waveforms_available = ui
@@ -173,9 +178,15 @@ pub fn timeline_panel(ui: &mut egui::Ui, state: &mut AppState, textures: &dyn Te
             pos2(timeline_rect.min.x, y),
             vec2(TRACK_HEADER_WIDTH, TRACK_HEIGHT),
         );
-        ui.painter()
-            .rect_filled(header_rect, CornerRadius::ZERO, theme::TRACK_HEADER_BG);
-        ui.painter().text(
+        header_painter.rect_filled(header_rect, CornerRadius::ZERO, theme::TRACK_HEADER_BG);
+        header_painter.line_segment(
+            [
+                pos2(header_rect.max.x, header_rect.min.y),
+                pos2(header_rect.max.x, header_rect.max.y),
+            ],
+            Stroke::new(1.0, theme::BORDER),
+        );
+        header_painter.text(
             header_rect.center(),
             egui::Align2::CENTER_CENTER,
             &layout.name,
@@ -223,11 +234,17 @@ pub fn timeline_panel(ui: &mut egui::Ui, state: &mut AppState, textures: &dyn Te
             }
         }
 
-        ui.painter()
-            .rect_filled(track_rect, CornerRadius::ZERO, theme::TRACK_BG);
+        content_painter.rect_filled(track_rect, CornerRadius::ZERO, theme::TRACK_BG);
+        track_row_painter.line_segment(
+            [
+                pos2(timeline_rect.min.x, y + TRACK_HEIGHT),
+                pos2(timeline_rect.max.x, y + TRACK_HEIGHT),
+            ],
+            Stroke::new(1.0, theme::BORDER),
+        );
 
         if track_response.dnd_hover_payload::<ClipId>().is_some() {
-            ui.painter().rect_stroke(
+            content_painter.rect_stroke(
                 track_rect,
                 CornerRadius::ZERO,
                 Stroke::new(2.0, theme::ACCENT),
@@ -323,6 +340,13 @@ pub fn timeline_panel(ui: &mut egui::Ui, state: &mut AppState, textures: &dyn Te
                     draw_waveform(&content_painter, clip_rect, visible_peaks);
                 }
             }
+
+            content_painter.rect_stroke(
+                clip_rect,
+                theme::ROUNDING_SM,
+                Stroke::new(1.0, clip_color.gamma_multiply(0.6)),
+                egui::StrokeKind::Inside,
+            );
 
             if clip_w >= 30.0 {
                 if let Some(clip) = state.project.clips.get(&tc_source_id) {
@@ -465,6 +489,9 @@ pub fn timeline_panel(ui: &mut egui::Ui, state: &mut AppState, textures: &dyn Te
                         original_out_point: tc.source_out,
                     });
                 } else {
+                    let grab_time = ((origin.x - content_left + scroll) / pps).max(0.0) as f64;
+                    let grab_offset = grab_time - tc.timeline_start;
+                    state.ui.timeline.drag_grab_offset = Some(grab_offset);
                     state.ui.timeline.dragging_clip = Some(tc_id);
                 }
             }
@@ -529,7 +556,7 @@ pub fn timeline_panel(ui: &mut egui::Ui, state: &mut AppState, textures: &dyn Te
     }
 
     let playhead_top = ruler_top;
-    let playhead_bottom = tracks_top + total_tracks as f32 * (TRACK_HEIGHT + 2.0);
+    let playhead_bottom = clip_area_bottom;
     let playhead_clip = Rect::from_min_max(
         pos2(content_left, playhead_top),
         pos2(content_left + content_width, playhead_bottom),
@@ -540,19 +567,30 @@ pub fn timeline_panel(ui: &mut egui::Ui, state: &mut AppState, textures: &dyn Te
             pos2(playhead_x, playhead_top),
             pos2(playhead_x, playhead_bottom),
         ],
-        Stroke::new(2.0, theme::PLAYHEAD_COLOR),
+        Stroke::new(1.5, theme::PLAYHEAD_COLOR),
     );
 
     let playhead_head =
         Rect::from_center_size(pos2(playhead_x, playhead_top + 4.0), vec2(10.0, 8.0));
     playhead_painter.rect_filled(playhead_head, CornerRadius::same(2), theme::PLAYHEAD_COLOR);
 
+    if needs_vertical_scroll {
+        draw_vertical_scrollbar(
+            ui,
+            state,
+            timeline_rect.max.x - V_SCROLLBAR_WIDTH,
+            clip_area_top,
+            clip_area_bottom - clip_area_top,
+            total_track_height,
+        );
+    }
+
     draw_scrollbar(
         ui,
         state,
         content_left,
         content_width,
-        playhead_bottom + 4.0,
+        clip_area_bottom + 4.0,
     );
 }
 
@@ -634,9 +672,8 @@ fn handle_clip_trim(
         .find_clip(trim_clip_id)
         .and_then(|(_, _, tc)| state.project.clips.get(&tc.source_id))
         .and_then(|clip| clip.duration);
-    let max_source_out = source_clip_duration.unwrap_or(original_out_point.max(
-        original_in_point + original_duration,
-    ));
+    let max_source_out = source_clip_duration
+        .unwrap_or(original_out_point.max(original_in_point + original_duration));
 
     if let Some((track, clip_idx)) = state.project.timeline.find_clip_track_mut(trim_clip_id) {
         let tc = &mut track.clips[clip_idx];
@@ -694,7 +731,9 @@ fn handle_clip_drag_drop(
         return;
     }
 
+    let grab_offset = state.ui.timeline.drag_grab_offset.unwrap_or(0.0);
     state.ui.timeline.dragging_clip = None;
+    state.ui.timeline.drag_grab_offset = None;
 
     let Some(pointer) = ui.input(|i| i.pointer.hover_pos()) else {
         return;
@@ -723,7 +762,8 @@ fn handle_clip_drag_drop(
         }
     }
 
-    let new_pos = ((pointer.x - content_left + scroll) / pps).max(0.0) as f64;
+    let new_pos =
+        (((pointer.x - content_left + scroll) / pps).max(0.0) as f64 - grab_offset).max(0.0);
     let (new_pos, _) = snap_time_to_clip_boundaries(state, new_pos, pps, Some(src_clip_id));
 
     if src_track_id == dst_track_id {
@@ -814,6 +854,46 @@ fn draw_scrollbar(ui: &mut egui::Ui, state: &mut AppState, left: f32, width: f32
             let frac = ((pointer.x - left) / width).clamp(0.0, 1.0);
             let max_scroll = (total_width - width).max(0.0);
             state.ui.timeline.scroll_offset = frac * max_scroll;
+        }
+    }
+}
+
+fn draw_vertical_scrollbar(
+    ui: &mut egui::Ui,
+    state: &mut AppState,
+    left: f32,
+    top: f32,
+    height: f32,
+    total_track_height: f32,
+) {
+    let scrollbar_rect = Rect::from_min_size(pos2(left, top), vec2(V_SCROLLBAR_WIDTH, height));
+    ui.painter()
+        .rect_filled(scrollbar_rect, CornerRadius::ZERO, theme::RULER_BG);
+
+    let visible_fraction = (height / total_track_height).clamp(0.05, 1.0);
+    let max_v_scroll = (total_track_height - height).max(1.0);
+    let scroll_fraction = state.ui.timeline.vertical_scroll_offset / max_v_scroll;
+
+    let thumb_h = (height * visible_fraction).max(20.0);
+    let thumb_y = top + scroll_fraction * (height - thumb_h);
+    let thumb_rect = Rect::from_min_size(
+        pos2(left + 1.0, thumb_y),
+        vec2(V_SCROLLBAR_WIDTH - 2.0, thumb_h),
+    );
+
+    ui.painter()
+        .rect_filled(thumb_rect, CornerRadius::same(3), theme::BG_SURFACE);
+
+    let response = ui.interact(
+        scrollbar_rect,
+        egui::Id::new("timeline_v_scrollbar"),
+        Sense::click_and_drag(),
+    );
+
+    if response.dragged() || response.clicked() {
+        if let Some(pointer) = response.interact_pointer_pos() {
+            let frac = ((pointer.y - top) / height).clamp(0.0, 1.0);
+            state.ui.timeline.vertical_scroll_offset = frac * max_v_scroll;
         }
     }
 }
@@ -913,9 +993,18 @@ fn draw_drag_ghosts(
     }
 
     let target_kind = track_layouts[target_display_idx].kind;
-    let drop_time = ((pointer.x - content_left + scroll) / pps).max(0.0) as f64;
+    let raw_drop_time = ((pointer.x - content_left + scroll) / pps).max(0.0) as f64;
 
     let has_timeline_drag = state.ui.timeline.dragging_clip.is_some();
+    let grab_offset = state.ui.timeline.drag_grab_offset.unwrap_or(0.0);
+    let unsnapped_drop_time = if has_timeline_drag {
+        (raw_drop_time - grab_offset).max(0.0)
+    } else {
+        raw_drop_time
+    };
+    let exclude_clip = state.ui.timeline.dragging_clip;
+    let (drop_time, _snapped) =
+        snap_time_to_clip_boundaries(state, unsnapped_drop_time, pps, exclude_clip);
 
     let paired_track_id = track_layouts[target_display_idx].track_id;
     let paired_id = state.project.timeline.paired_track_id(paired_track_id);

@@ -155,6 +155,7 @@ pub struct TimelineUiState {
     pub vertical_scroll_offset: f32,
     pub scrubbing: Option<f64>,
     pub dragging_clip: Option<TimelineClipId>,
+    pub drag_grab_offset: Option<f64>,
     pub trimming_clip: Option<TrimState>,
 }
 
@@ -166,6 +167,7 @@ impl Default for TimelineUiState {
             vertical_scroll_offset: 0.0,
             scrubbing: None,
             dragging_clip: None,
+            drag_grab_offset: None,
             trimming_clip: None,
         }
     }

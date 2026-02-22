@@ -409,6 +409,13 @@ fn clip_thumbnail(
                 Stroke::new(2.0, theme::ACCENT),
                 StrokeKind::Outside,
             );
+        } else {
+            ui.painter().rect_stroke(
+                thumb_rect,
+                theme::ROUNDING,
+                Stroke::new(1.0, theme::BORDER),
+                StrokeKind::Outside,
+            );
         }
 
         if is_starred {

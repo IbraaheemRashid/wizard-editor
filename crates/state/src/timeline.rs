@@ -578,6 +578,20 @@ impl Timeline {
     }
 }
 
+impl Timeline {
+    pub fn next_clip_after(&self, id: TimelineClipId) -> Option<PlayheadHit> {
+        let (_, _, tc) = self.find_clip(id)?;
+        let next_time = tc.timeline_start + tc.duration;
+        self.clip_at_time(next_time)
+    }
+
+    pub fn time_remaining_in_clip(&self, id: TimelineClipId, playhead: f64) -> Option<f64> {
+        let (_, _, tc) = self.find_clip(id)?;
+        let clip_end = tc.timeline_start + tc.duration;
+        Some((clip_end - playhead).max(0.0))
+    }
+}
+
 impl Default for Timeline {
     fn default() -> Self {
         Self::new()
