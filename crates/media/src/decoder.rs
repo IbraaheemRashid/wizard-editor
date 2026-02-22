@@ -52,7 +52,7 @@ pub fn init_once() {
     INIT.call_once(|| {
         ffmpeg::init().expect("failed to initialize ffmpeg");
         unsafe {
-            ffmpeg::ffi::av_log_set_level(ffmpeg::ffi::AV_LOG_ERROR);
+            ffmpeg::ffi::av_log_set_level(ffmpeg::ffi::AV_LOG_FATAL);
         }
     });
 }
@@ -407,7 +407,7 @@ impl VideoDecoder {
     }
 }
 
-fn fit_dimensions(src_w: u32, src_h: u32, max_w: u32, max_h: u32) -> (u32, u32) {
+pub fn fit_dimensions(src_w: u32, src_h: u32, max_w: u32, max_h: u32) -> (u32, u32) {
     if src_w == 0 || src_h == 0 {
         return (max_w, max_h);
     }

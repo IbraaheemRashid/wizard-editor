@@ -398,6 +398,36 @@ pub fn timeline_panel(ui: &mut egui::Ui, state: &mut AppState, textures: &dyn Te
                     && (p.x - clip_rect.max.x).abs() < effective_trim_w
             });
 
+            let is_being_trimmed = state
+                .ui
+                .timeline
+                .trimming_clip
+                .as_ref()
+                .is_some_and(|t| t.clip_id == tc_id);
+
+            if hover_on_left || is_being_trimmed {
+                let handle_rect = Rect::from_min_size(
+                    pos2(clip_rect.min.x, clip_rect.min.y),
+                    vec2(3.0, clip_rect.height()),
+                );
+                content_painter.rect_filled(
+                    handle_rect,
+                    CornerRadius::ZERO,
+                    Color32::from_white_alpha(180),
+                );
+            }
+            if hover_on_right || is_being_trimmed {
+                let handle_rect = Rect::from_min_size(
+                    pos2(clip_rect.max.x - 3.0, clip_rect.min.y),
+                    vec2(3.0, clip_rect.height()),
+                );
+                content_painter.rect_filled(
+                    handle_rect,
+                    CornerRadius::ZERO,
+                    Color32::from_white_alpha(180),
+                );
+            }
+
             if (hover_on_left || hover_on_right)
                 && state.ui.timeline.trimming_clip.is_none()
                 && state.ui.timeline.dragging_clip.is_none()

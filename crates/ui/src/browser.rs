@@ -334,8 +334,11 @@ fn clip_thumbnail(
 
         if let Some((idx, _)) = scrub_info {
             if let Some(frames) = textures.preview_frames(&clip_id) {
-                ui.painter()
-                    .image(frames[idx].id(), thumb_rect, uv, Color32::WHITE);
+                let safe_idx = idx.min(frames.len().saturating_sub(1));
+                if !frames.is_empty() {
+                    ui.painter()
+                        .image(frames[safe_idx].id(), thumb_rect, uv, Color32::WHITE);
+                }
             }
         } else if let Some(tex) = textures.thumbnail(&clip_id) {
             ui.painter().image(tex.id(), thumb_rect, uv, Color32::WHITE);
@@ -480,7 +483,21 @@ fn clip_thumbnail(
             );
         }
 
-        if hover_ready && preview_frames.is_some_and(|f| !f.is_empty()) {
+        let has_some_frames = preview_frames.is_some_and(|f| !f.is_empty());
+        if hover_ready && has_some_frames {
+            ui.ctx().request_repaint();
+        }
+
+        if hover_ready && !has_some_frames && textures.is_preview_loading(&clip_id) {
+            let overlay = Color32::from_black_alpha(120);
+            ui.painter()
+                .rect_filled(thumb_rect, theme::ROUNDING, overlay);
+            let spinner_size = 16.0;
+            let spinner_rect =
+                Rect::from_center_size(thumb_rect.center(), vec2(spinner_size, spinner_size));
+            egui::Spinner::new()
+                .size(spinner_size)
+                .paint_at(ui, spinner_rect);
             ui.ctx().request_repaint();
         }
     }

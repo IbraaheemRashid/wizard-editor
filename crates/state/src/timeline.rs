@@ -499,7 +499,7 @@ impl Timeline {
             let track_id = track.id;
 
             let track = self.track_by_id_mut(track_id).expect("track exists");
-            let idx_to_skip = track
+            let mut idx_to_skip = track
                 .clips
                 .iter()
                 .position(|c| c.id == clip_id)
@@ -524,7 +524,7 @@ impl Timeline {
                 if c_start >= start && c_end <= end {
                     track.clips.remove(i);
                     if idx_to_skip > i {
-                        break;
+                        idx_to_skip -= 1;
                     }
                     continue;
                 }

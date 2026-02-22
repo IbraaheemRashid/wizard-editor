@@ -11,7 +11,7 @@ use ffmpeg::util::frame::video::Video as VideoFrame;
 use ffmpeg_the_third as ffmpeg;
 use ringbuf::traits::Producer;
 
-use crate::decoder::init_once;
+use crate::decoder::{fit_dimensions, init_once};
 
 pub type AudioProducer = ringbuf::HeapProd<f32>;
 
@@ -446,18 +446,6 @@ fn convert_video_frame(
     }
 
     Some((target_w, target_h, pixels))
-}
-
-fn fit_dimensions(src_w: u32, src_h: u32, max_w: u32, max_h: u32) -> (u32, u32) {
-    if src_w == 0 || src_h == 0 {
-        return (max_w, max_h);
-    }
-    let scale_w = max_w as f64 / src_w as f64;
-    let scale_h = max_h as f64 / src_h as f64;
-    let scale = scale_w.min(scale_h);
-    let w = ((src_w as f64 * scale).round() as u32).max(2) & !1;
-    let h = ((src_h as f64 * scale).round() as u32).max(2) & !1;
-    (w.min(max_w), h.min(max_h))
 }
 
 const GOP_WINDOW: f64 = 4.0;

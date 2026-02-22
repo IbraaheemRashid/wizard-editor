@@ -43,6 +43,10 @@ impl wizard_ui::TextureLookup for TextureCache {
         self.pending_thumbnails.contains(id)
     }
 
+    fn is_preview_loading(&self, id: &ClipId) -> bool {
+        self.preview_requested.contains(id)
+    }
+
     fn waveform_peaks(&self, id: &ClipId) -> Option<&Vec<(f32, f32)>> {
         self.waveform_peaks.get(id)
     }
@@ -211,26 +215,30 @@ impl EditorApp {
             received = true;
         }
 
-        while let Ok((id, images)) = self.preview.result_rx.try_recv() {
-            if images.is_empty() {
-                self.textures.preview_requested.remove(&id);
-                continue;
-            }
-            let textures: Vec<egui::TextureHandle> = images
-                .iter()
-                .enumerate()
-                .map(|(i, img)| {
+        while let Ok(pf) = self.preview.result_rx.try_recv() {
+            let texture = ctx.load_texture(
+                format!("preview_{:?}_{}", pf.clip_id, pf.index),
+                egui::ColorImage::from_rgba_unmultiplied(
+                    [pf.image.width() as usize, pf.image.height() as usize],
+                    pf.image.as_raw(),
+                ),
+                egui::TextureOptions::LINEAR,
+            );
+            let frames = self
+                .textures
+                .preview_frames
+                .entry(pf.clip_id)
+                .or_insert_with(|| Vec::with_capacity(pf.total));
+            if frames.len() <= pf.index {
+                frames.resize_with(pf.index + 1, || {
                     ctx.load_texture(
-                        format!("preview_{:?}_{}", id, i),
-                        egui::ColorImage::from_rgba_unmultiplied(
-                            [img.width() as usize, img.height() as usize],
-                            img.as_raw(),
-                        ),
-                        egui::TextureOptions::LINEAR,
+                        "placeholder",
+                        egui::ColorImage::new([1, 1], egui::Color32::TRANSPARENT),
+                        Default::default(),
                     )
-                })
-                .collect();
-            self.textures.preview_frames.insert(id, textures);
+                });
+            }
+            frames[pf.index] = texture;
             received = true;
         }
 
@@ -248,8 +256,10 @@ impl EditorApp {
             }
         }
         for frame in &pipeline_frames {
-            self.apply_pipeline_frame(ctx, frame, now);
             received = true;
+            if !self.apply_pipeline_frame(ctx, frame, now) {
+                break;
+            }
         }
 
         let mut reverse_frames: Vec<DecodedFrame> = Vec::new();
@@ -259,8 +269,10 @@ impl EditorApp {
             }
         }
         for frame in &reverse_frames {
-            self.apply_reverse_pipeline_frame(ctx, frame, now);
             received = true;
+            if !self.apply_reverse_pipeline_frame(ctx, frame, now) {
+                break;
+            }
         }
 
         while let Ok((_clip_id, _time, img)) = self.video_decode.result_rx.try_recv() {
@@ -291,7 +303,7 @@ impl EditorApp {
         }
     }
 
-    fn apply_pipeline_frame(&mut self, ctx: &egui::Context, frame: &DecodedFrame, now: f64) {
+    fn apply_pipeline_frame(&mut self, ctx: &egui::Context, frame: &DecodedFrame, now: f64) -> bool {
         self.last_decoded_frame = Some((frame.pts_seconds, "fwd"));
         let texture = ctx.load_texture(
             "playback_frame",
@@ -314,21 +326,40 @@ impl EditorApp {
             });
         if let Some((timeline_start, duration, source_in, source_out)) = active_clip {
             if frame.pts_seconds >= source_in && frame.pts_seconds < source_out {
-                self.state.project.playback.playhead =
-                    timeline_start + (frame.pts_seconds - source_in);
+                let new_playhead = timeline_start + (frame.pts_seconds - source_in);
+                if new_playhead >= self.state.project.playback.playhead {
+                    self.state.project.playback.playhead = new_playhead;
+                }
             } else if frame.pts_seconds >= source_out {
-                self.state.project.playback.playhead = timeline_start + duration + 0.0001;
+                let next_time = timeline_start + duration;
+                self.state.project.playback.playhead = next_time;
                 self.pipeline = None;
                 self.pipeline_clip = None;
                 self.pipeline_timeline_clip = None;
                 self.pipeline_source_time = None;
                 self.last_pipeline_frame_time = None;
                 self.reset_audio_queue();
-                return;
+
+                if let Some(next_hit) = self.state.project.timeline.clip_at_time(next_time) {
+                    let next_clip_id = next_hit.clip.source_id;
+                    let next_timeline_clip_id = next_hit.clip.id;
+                    if let Some(clip) = self.state.project.clips.get(&next_clip_id) {
+                        let path = clip.path.clone();
+                        self.start_pipeline(
+                            next_timeline_clip_id,
+                            next_clip_id,
+                            &path,
+                            next_hit.source_time,
+                        );
+                    }
+                }
+                return false;
             }
         } else if let Some(timeline_pos) = self.find_timeline_hit_for_source_pts(frame.pts_seconds)
         {
-            self.state.project.playback.playhead = timeline_pos;
+            if timeline_pos >= self.state.project.playback.playhead {
+                self.state.project.playback.playhead = timeline_pos;
+            }
         }
         self.last_pipeline_frame_time = Some(now);
 
@@ -352,6 +383,7 @@ impl EditorApp {
                 self.video_fps_window_frames = 0;
             }
         }
+        true
     }
 
     fn apply_reverse_pipeline_frame(
@@ -359,7 +391,7 @@ impl EditorApp {
         ctx: &egui::Context,
         frame: &DecodedFrame,
         now: f64,
-    ) {
+    ) -> bool {
         self.last_decoded_frame = Some((frame.pts_seconds, "rev"));
         let texture = ctx.load_texture(
             "playback_frame",
@@ -375,15 +407,45 @@ impl EditorApp {
             if let Some((_, _, tc)) = self.state.project.timeline.find_clip(timeline_clip_id) {
                 if frame.pts_seconds >= tc.source_in && frame.pts_seconds < tc.source_out {
                     let timeline_pos = tc.timeline_start + (frame.pts_seconds - tc.source_in);
-                    self.state.project.playback.playhead = timeline_pos;
+                    if timeline_pos <= self.state.project.playback.playhead {
+                        self.state.project.playback.playhead = timeline_pos;
+                    }
                 } else if frame.pts_seconds < tc.source_in {
-                    self.state.project.playback.playhead = (tc.timeline_start - 0.0001).max(0.0);
+                    let prev_time = (tc.timeline_start - 0.001).max(0.0);
+                    self.state.project.playback.playhead = prev_time;
                     self.reverse_pipeline = None;
                     self.reverse_pipeline_clip = None;
                     self.reverse_pipeline_timeline_clip = None;
                     self.last_pipeline_frame_time = None;
                     self.reset_audio_queue();
-                    return;
+
+                    if prev_time > 0.0 {
+                        if let Some(prev_hit) =
+                            self.state.project.timeline.clip_at_time(prev_time)
+                        {
+                            let prev_clip_id = prev_hit.clip.source_id;
+                            let prev_timeline_clip_id = prev_hit.clip.id;
+                            if let Some(clip) = self.state.project.clips.get(&prev_clip_id) {
+                                let path = clip.path.clone();
+                                let speed = self.state.project.playback.speed;
+                                if let Ok(handle) = ReversePipelineHandle::start(
+                                    &path,
+                                    prev_hit.source_time,
+                                    speed,
+                                    workers::video_decode_worker::PLAYBACK_DECODE_WIDTH,
+                                    workers::video_decode_worker::PLAYBACK_DECODE_HEIGHT,
+                                ) {
+                                    self.reverse_pipeline = Some(handle);
+                                    self.reverse_pipeline_clip =
+                                        Some((prev_clip_id, path));
+                                    self.reverse_pipeline_timeline_clip =
+                                        Some(prev_timeline_clip_id);
+                                    self.reverse_pipeline_speed = speed;
+                                }
+                            }
+                        }
+                    }
+                    return false;
                 }
             }
         }
@@ -409,6 +471,7 @@ impl EditorApp {
                 self.video_fps_window_frames = 0;
             }
         }
+        true
     }
 
     fn find_timeline_hit_for_source_pts(&self, pts: f64) -> Option<f64> {
@@ -533,7 +596,7 @@ impl EditorApp {
 
             let has_stale_pipeline = self
                 .last_pipeline_frame_time
-                .is_some_and(|t| (now - t) > 0.35);
+                .is_some_and(|t| (now - t) > 0.75);
             if self.pipeline.is_some() && has_stale_pipeline && !needs_new_pipeline {
                 self.pipeline = None;
                 self.pipeline_clip = None;
@@ -780,46 +843,31 @@ impl EditorApp {
         if self.audio_output.is_none() {
             return;
         }
-
         let Some(time) = self.state.ui.timeline.scrubbing else {
             return;
         };
-
         if self.state.ui.browser.hovered_scrub_t.is_some() {
             return;
         }
-
-        let mut found_clip_id = None;
-        let mut found_path = None;
-        let mut found_time = 0.0;
-
-        if let Some(hit) = self.state.project.timeline.audio_clip_at_time(time) {
-            if let Some(clip) = self.state.project.clips.get(&hit.clip.source_id) {
-                found_clip_id = Some(hit.clip.source_id);
-                found_path = Some(clip.path.clone());
-                found_time = hit.source_time;
-            }
-        }
-
-        let Some(clip_id) = found_clip_id else {
+        let Some(hit) = self.state.project.timeline.audio_clip_at_time(time) else {
             return;
         };
-        let Some(path) = found_path else {
+        let Some(clip) = self.state.project.clips.get(&hit.clip.source_id) else {
             return;
         };
-        if self.path_has_no_audio(&path) {
+        if self.path_has_no_audio(&clip.path) {
             return;
         }
 
-        let bucket = (found_time * 10.0).round() as i64;
-        if self.last_scrub_audio_request == Some((clip_id, bucket)) {
+        let bucket = (hit.source_time * 10.0).round() as i64;
+        if self.last_scrub_audio_request == Some((hit.clip.source_id, bucket)) {
             return;
         }
-        self.last_scrub_audio_request = Some((clip_id, bucket));
+        self.last_scrub_audio_request = Some((hit.clip.source_id, bucket));
 
         let _ = self.audio.req_tx.send(AudioPreviewRequest::Preview {
-            path,
-            time_seconds: found_time,
+            path: clip.path.clone(),
+            time_seconds: hit.source_time,
             sample_rate_hz: self.audio_sample_rate,
         });
     }
@@ -991,14 +1039,9 @@ impl eframe::App for EditorApp {
             let dt = now - last;
             let duration = self.state.project.timeline.timeline_duration();
             let pipeline_driving = self.pipeline.is_some() || self.reverse_pipeline.is_some();
-            let has_recent_pipeline_frame = self
-                .last_pipeline_frame_time
-                .is_some_and(|t| (now - t) < 0.25);
-            let pipeline_warming_up = pipeline_driving && self.last_pipeline_frame_time.is_none();
-            let should_use_clock_advance = !pipeline_driving
-                || !has_recent_pipeline_frame
-                || self.state.project.playback.state == PlaybackState::Stopped;
-            if should_use_clock_advance && !pipeline_warming_up {
+            let should_use_clock_advance =
+                !pipeline_driving && self.state.project.playback.state != PlaybackState::Stopped;
+            if should_use_clock_advance {
                 self.state.project.playback.advance(dt, duration);
             }
             if dt > 0.0 {

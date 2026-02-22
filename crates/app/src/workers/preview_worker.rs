@@ -3,12 +3,21 @@ use std::sync::mpsc;
 
 use wizard_state::clip::ClipId;
 
+const PREVIEW_FRAME_COUNT: usize = 16;
+
 pub enum PreviewRequest {
     Enqueue {
         clip_id: ClipId,
         path: std::path::PathBuf,
         priority: bool,
     },
+}
+
+pub struct PreviewFrame {
+    pub clip_id: ClipId,
+    pub index: usize,
+    pub total: usize,
+    pub image: image::RgbaImage,
 }
 
 fn apply_preview_req(
@@ -37,7 +46,7 @@ fn apply_preview_req(
 
 pub struct PreviewWorkerChannels {
     pub req_tx: mpsc::Sender<PreviewRequest>,
-    pub result_rx: mpsc::Receiver<(ClipId, Vec<image::RgbaImage>)>,
+    pub result_rx: mpsc::Receiver<PreviewFrame>,
 }
 
 pub fn spawn_preview_worker() -> PreviewWorkerChannels {
@@ -64,8 +73,27 @@ pub fn spawn_preview_worker() -> PreviewWorkerChannels {
                 apply_preview_req(req, &mut queue, &mut queued);
             }
 
-            let frames = wizard_media::thumbnail::extract_preview_frames(&path, 32);
-            let _ = result_tx.send((clip_id, frames));
+            let (frame_tx, frame_rx) = mpsc::channel();
+            wizard_media::thumbnail::extract_preview_frames_streaming(
+                &path,
+                PREVIEW_FRAME_COUNT,
+                &frame_tx,
+            );
+            drop(frame_tx);
+
+            while let Ok((index, image)) = frame_rx.recv() {
+                if result_tx
+                    .send(PreviewFrame {
+                        clip_id,
+                        index,
+                        total: PREVIEW_FRAME_COUNT,
+                        image,
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+            }
         }
     });
 
