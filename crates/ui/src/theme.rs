@@ -14,6 +14,7 @@ pub const STAR_COLOR: Color32 = Color32::from_rgb(255, 200, 50);
 pub const TRACK_HEADER_BG: Color32 = Color32::from_rgb(35, 35, 55);
 pub const RULER_BG: Color32 = Color32::from_rgb(20, 20, 35);
 pub const RULER_TICK: Color32 = Color32::from_rgb(60, 60, 80);
+pub const WAVEFORM_COLOR: Color32 = Color32::from_rgba_premultiplied(180, 255, 200, 240);
 
 pub const ROUNDING: CornerRadius = CornerRadius::same(4);
 pub const ROUNDING_SM: CornerRadius = CornerRadius::same(3);

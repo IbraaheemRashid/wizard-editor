@@ -11,3 +11,5 @@ wizard-audio = { workspace = true }
 eframe = { workspace = true }
 egui = { workspace = true }
 image = { workspace = true }
+notify = { workspace = true }
+ringbuf = { workspace = true }

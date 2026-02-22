@@ -2,14 +2,14 @@ use egui::vec2;
 use wizard_state::playback::PlaybackState;
 use wizard_state::project::AppState;
 
-use crate::browser::TextureLookup;
 use crate::theme;
+use crate::TextureLookup;
 
 pub fn preview_panel(ui: &mut egui::Ui, state: &mut AppState, textures: &dyn TextureLookup) {
     let available = ui.available_size();
 
     let is_active = state.project.playback.state != PlaybackState::Stopped
-        || state.ui.timeline_scrubbing.is_some();
+        || state.ui.timeline.scrubbing.is_some();
 
     let has_frame = textures.playback_frame().is_some();
 

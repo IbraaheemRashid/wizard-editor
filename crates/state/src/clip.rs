@@ -31,16 +31,6 @@ pub struct Clip {
 }
 
 impl Clip {
-    pub fn display_name(&self) -> &str {
-        self.display_name.as_deref().unwrap_or(&self.filename)
-    }
-
-    pub fn extension(&self) -> &str {
-        self.path.extension().and_then(|e| e.to_str()).unwrap_or("")
-    }
-}
-
-impl Clip {
     pub fn from_path(path: PathBuf) -> Self {
         let filename = path
             .file_name()
@@ -63,6 +53,14 @@ impl Clip {
             codec: None,
             search_haystack,
         }
+    }
+
+    pub fn display_name(&self) -> &str {
+        self.display_name.as_deref().unwrap_or(&self.filename)
+    }
+
+    pub fn extension(&self) -> &str {
+        self.path.extension().and_then(|e| e.to_str()).unwrap_or("")
     }
 
     pub fn rebuild_search_haystack(&mut self, tag_mask: u32) {

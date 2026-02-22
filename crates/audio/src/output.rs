@@ -1,23 +1,19 @@
-use std::collections::VecDeque;
-use std::sync::{Arc, Mutex};
-
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, Sample, SampleFormat};
+use ringbuf::traits::{Consumer, Producer, Split};
+use ringbuf::HeapRb;
 
-#[derive(Clone)]
+pub type AudioProducer = ringbuf::HeapProd<f32>;
+pub type AudioConsumer = ringbuf::HeapCons<f32>;
+
 pub struct AudioOutput {
-    state: Arc<Mutex<AudioOutputState>>,
-    _stream: Arc<cpal::Stream>,
-}
-
-struct AudioOutputState {
-    samples_mono: VecDeque<f32>,
+    _stream: cpal::Stream,
     sample_rate_hz: u32,
-    channels: usize,
+    channels: u16,
 }
 
 impl AudioOutput {
-    pub fn new() -> Result<Self, String> {
+    pub fn new() -> Result<(Self, AudioProducer), String> {
         let host = cpal::default_host();
         let device = host
             .default_output_device()
@@ -28,24 +24,21 @@ impl AudioOutput {
             .map_err(|e| format!("Failed to get default output config: {e}"))?;
 
         let sample_rate_hz = supported.sample_rate().0;
-        let channels = supported.channels() as usize;
         let sample_format = supported.sample_format();
         let config: cpal::StreamConfig = supported.into();
+        let channels = config.channels;
 
-        let state = Arc::new(Mutex::new(AudioOutputState {
-            samples_mono: VecDeque::new(),
-            sample_rate_hz,
-            channels: channels.max(1),
-        }));
+        let rb = HeapRb::<f32>::new(sample_rate_hz as usize / 4);
+        let (producer, consumer) = rb.split();
 
         let err_fn = |err| {
             eprintln!("audio stream error: {err}");
         };
 
         let stream = match sample_format {
-            SampleFormat::F32 => build_stream::<f32>(device, &config, state.clone(), err_fn)?,
-            SampleFormat::I16 => build_stream::<i16>(device, &config, state.clone(), err_fn)?,
-            SampleFormat::U16 => build_stream::<u16>(device, &config, state.clone(), err_fn)?,
+            SampleFormat::F32 => build_stream::<f32>(device, &config, consumer, err_fn)?,
+            SampleFormat::I16 => build_stream::<i16>(device, &config, consumer, err_fn)?,
+            SampleFormat::U16 => build_stream::<u16>(device, &config, consumer, err_fn)?,
             other => return Err(format!("Unsupported sample format: {other}")),
         };
 
@@ -53,67 +46,57 @@ impl AudioOutput {
             .play()
             .map_err(|e| format!("Failed to start audio stream: {e}"))?;
 
-        Ok(Self {
-            state,
-            _stream: Arc::new(stream),
-        })
-    }
-
-    pub fn clear(&self) {
-        if let Ok(mut state) = self.state.lock() {
-            state.samples_mono.clear();
-        }
-    }
-
-    pub fn enqueue_mono_samples(&self, samples: &[f32]) {
-        if samples.is_empty() {
-            return;
-        }
-        if let Ok(mut state) = self.state.lock() {
-            state.samples_mono.extend(samples.iter().copied());
-        }
+        Ok((
+            Self {
+                _stream: stream,
+                sample_rate_hz,
+                channels,
+            },
+            producer,
+        ))
     }
 
     pub fn sample_rate_hz(&self) -> u32 {
-        self.state
-            .lock()
-            .map(|s| s.sample_rate_hz)
-            .unwrap_or(48_000)
+        self.sample_rate_hz
     }
 
-    pub fn channels(&self) -> usize {
-        self.state.lock().map(|s| s.channels).unwrap_or(2)
+    pub fn channels(&self) -> u16 {
+        self.channels
+    }
+}
+
+pub fn enqueue_samples(producer: &mut AudioProducer, samples: &[f32], channels: u16) {
+    if samples.is_empty() {
+        return;
+    }
+    let ch = channels as usize;
+    if ch <= 1 {
+        let _ = producer.push_slice(samples);
+    } else {
+        for &s in samples {
+            for _ in 0..ch {
+                let _ = producer.try_push(s);
+            }
+        }
     }
 }
 
 fn build_stream<T>(
     device: cpal::Device,
     config: &cpal::StreamConfig,
-    state: Arc<Mutex<AudioOutputState>>,
+    mut consumer: AudioConsumer,
     err_fn: impl FnMut(cpal::StreamError) + Send + 'static,
 ) -> Result<cpal::Stream, String>
 where
     T: Sample + FromSample<f32> + cpal::SizedSample,
 {
-    let channels = config.channels as usize;
     device
         .build_output_stream(
             config,
             move |data: &mut [T], _| {
-                let mut guard = match state.lock() {
-                    Ok(g) => g,
-                    Err(_) => return,
-                };
-
-                let mut i = 0;
-                while i < data.len() {
-                    let sample = guard.samples_mono.pop_front().unwrap_or(0.0);
-                    for c in 0..channels {
-                        if i + c < data.len() {
-                            data[i + c] = T::from_sample(sample);
-                        }
-                    }
-                    i += channels;
+                for sample in data.iter_mut() {
+                    let s = consumer.try_pop().unwrap_or(0.0);
+                    *sample = T::from_sample(s);
                 }
             },
             err_fn,

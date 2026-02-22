@@ -4,9 +4,8 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-wizard-state = { workspace = true }
 image = { workspace = true }
-rayon = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 ffmpeg-the-third = { workspace = true }
+ringbuf = { workspace = true }

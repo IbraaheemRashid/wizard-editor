@@ -8,19 +8,12 @@ use wizard_state::tag::Tag;
 
 use crate::constants;
 use crate::theme;
+use crate::TextureLookup;
 
 pub enum BrowserAction {
     None,
     Collapse,
     ImportFolder(PathBuf),
-}
-
-pub trait TextureLookup {
-    fn thumbnail(&self, id: &ClipId) -> Option<&egui::TextureHandle>;
-    fn preview_frames(&self, id: &ClipId) -> Option<&Vec<egui::TextureHandle>>;
-    fn is_pending(&self, id: &ClipId) -> bool;
-    fn waveform_peaks(&self, id: &ClipId) -> Option<&Vec<(f32, f32)>>;
-    fn playback_frame(&self) -> Option<&egui::TextureHandle>;
 }
 
 pub fn browser_panel(
@@ -29,8 +22,8 @@ pub fn browser_panel(
     textures: &dyn TextureLookup,
 ) -> BrowserAction {
     state.ui.selection.hovered_clip = None;
-    state.ui.hovered_scrub_t = None;
-    state.ui.visible_clips.clear();
+    state.ui.browser.hovered_scrub_t = None;
+    state.ui.browser.visible_clips.clear();
 
     let mut action = BrowserAction::None;
     egui::ScrollArea::both()
@@ -59,17 +52,17 @@ pub fn browser_panel(
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 ui.label("Search:");
-                ui.text_edit_singleline(&mut state.ui.search_query);
-                let star_label = if state.ui.starred_only {
+                ui.text_edit_singleline(&mut state.ui.browser.search_query);
+                let star_label = if state.ui.browser.starred_only {
                     "\u{2605} Starred"
                 } else {
                     "\u{2606} Starred"
                 };
                 if ui
-                    .selectable_label(state.ui.starred_only, star_label)
+                    .selectable_label(state.ui.browser.starred_only, star_label)
                     .clicked()
                 {
-                    state.ui.starred_only = !state.ui.starred_only;
+                    state.ui.browser.starred_only = !state.ui.browser.starred_only;
                 }
             });
 
@@ -77,27 +70,31 @@ pub fn browser_panel(
             ui.horizontal_wrapped(|ui| {
                 ui.label("Tags:");
                 for tag in Tag::ALL {
-                    let is_selected = (state.ui.tag_filter_mask & tag.bit()) != 0;
+                    let is_selected = (state.ui.browser.tag_filter_mask & tag.bit()) != 0;
                     if ui.selectable_label(is_selected, tag.label()).clicked() {
-                        state.ui.tag_filter_mask ^= tag.bit();
+                        state.ui.browser.tag_filter_mask ^= tag.bit();
                     }
                 }
-                if state.ui.tag_filter_mask != 0 && ui.button("Clear").clicked() {
-                    state.ui.tag_filter_mask = 0;
+                if state.ui.browser.tag_filter_mask != 0 && ui.button("Clear").clicked() {
+                    state.ui.browser.tag_filter_mask = 0;
                 }
             });
             ui.add_space(2.0);
             ui.horizontal(|ui| {
                 ui.label("Sort:");
-                let current_label = state.ui.sort_mode.label();
+                let current_label = state.ui.browser.sort_mode.label();
                 egui::ComboBox::from_id_salt("sort_mode")
                     .selected_text(current_label)
                     .show_ui(ui, |ui| {
                         for &mode in SortMode::ALL {
-                            ui.selectable_value(&mut state.ui.sort_mode, mode, mode.label());
+                            ui.selectable_value(
+                                &mut state.ui.browser.sort_mode,
+                                mode,
+                                mode.label(),
+                            );
                         }
                     });
-                let label = if state.ui.sort_ascending {
+                let label = if state.ui.browser.sort_ascending {
                     "A-Z"
                 } else {
                     "Z-A"
@@ -107,7 +104,7 @@ pub fn browser_panel(
                     .on_hover_text("Toggle sort direction")
                     .clicked()
                 {
-                    state.ui.sort_ascending = !state.ui.sort_ascending;
+                    state.ui.browser.sort_ascending = !state.ui.browser.sort_ascending;
                 }
             });
             ui.add_space(4.0);
@@ -147,8 +144,8 @@ pub fn browser_panel(
                 });
 
             if !is_any_tile_hovered {
-                state.ui.hover_active_clip = None;
-                state.ui.hover_started_at = None;
+                state.ui.browser.hover_active_clip = None;
+                state.ui.browser.hover_started_at = None;
             }
         });
 
@@ -220,21 +217,22 @@ fn clip_thumbnail(
 
     let is_hovered = response.hovered();
     let now = ui.input(|i| i.time);
-    if is_hovered && state.ui.hover_active_clip != Some(clip_id) {
-        state.ui.hover_active_clip = Some(clip_id);
-        state.ui.hover_started_at = Some(now);
+    if is_hovered && state.ui.browser.hover_active_clip != Some(clip_id) {
+        state.ui.browser.hover_active_clip = Some(clip_id);
+        state.ui.browser.hover_started_at = Some(now);
     }
 
     let hover_ready = !is_selected
         && is_hovered
-        && state.ui.hover_active_clip == Some(clip_id)
+        && state.ui.browser.hover_active_clip == Some(clip_id)
         && state
             .ui
+            .browser
             .hover_started_at
             .is_some_and(|started_at| now - started_at >= constants::HOVER_SCRUB_DELAY_SECS);
 
-    if !is_selected && is_hovered && state.ui.hover_active_clip == Some(clip_id) {
-        if let Some(started_at) = state.ui.hover_started_at {
+    if !is_selected && is_hovered && state.ui.browser.hover_active_clip == Some(clip_id) {
+        if let Some(started_at) = state.ui.browser.hover_started_at {
             let remaining = constants::HOVER_SCRUB_DELAY_SECS - (now - started_at);
             if remaining > 0.0 {
                 ui.ctx()
@@ -257,8 +255,8 @@ fn clip_thumbnail(
                 .get(&clip_id)
                 .map(|c| c.display_name().to_string())
                 .unwrap_or_default();
-            state.ui.renaming_clip = Some(clip_id);
-            state.ui.rename_buffer = current_name;
+            state.ui.browser.renaming_clip = Some(clip_id);
+            state.ui.browser.rename_buffer = current_name;
             ui.close_menu();
         }
 
@@ -273,7 +271,7 @@ fn clip_thumbnail(
     });
 
     if ui.is_rect_visible(rect) {
-        state.ui.visible_clips.push(clip_id);
+        state.ui.browser.visible_clips.push(clip_id);
         let thumb_rect = Rect::from_min_size(rect.min, thumb_size);
         let uv = Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
 
@@ -305,7 +303,7 @@ fn clip_thumbnail(
 
         if hover_ready {
             state.ui.selection.hovered_clip = Some(clip_id);
-            state.ui.hovered_scrub_t = hover_t;
+            state.ui.browser.hovered_scrub_t = hover_t;
         }
 
         let selected_t = if is_selected {
@@ -424,16 +422,16 @@ fn clip_thumbnail(
             egui::pos2(rect.min.x, thumb_rect.max.y + 2.0),
             vec2(thumb_size.x, 16.0),
         );
-        let is_renaming = state.ui.renaming_clip == Some(clip_id);
+        let is_renaming = state.ui.browser.renaming_clip == Some(clip_id);
         if is_renaming {
-            let text_edit = egui::TextEdit::singleline(&mut state.ui.rename_buffer)
+            let text_edit = egui::TextEdit::singleline(&mut state.ui.browser.rename_buffer)
                 .desired_width(thumb_size.x)
                 .font(egui::FontId::proportional(11.0));
             let re = ui.put(label_rect, text_edit);
             if re.lost_focus() {
                 let escaped = ui.input(|i| i.key_pressed(egui::Key::Escape));
                 if !escaped {
-                    let new_name = state.ui.rename_buffer.trim().to_string();
+                    let new_name = state.ui.browser.rename_buffer.trim().to_string();
                     if !new_name.is_empty() {
                         let tag_mask = state.project.clip_tag_mask(clip_id);
                         if let Some(clip) = state.project.clips.get_mut(&clip_id) {
@@ -442,8 +440,8 @@ fn clip_thumbnail(
                         }
                     }
                 }
-                state.ui.renaming_clip = None;
-                state.ui.rename_buffer.clear();
+                state.ui.browser.renaming_clip = None;
+                state.ui.browser.rename_buffer.clear();
             } else {
                 re.request_focus();
             }

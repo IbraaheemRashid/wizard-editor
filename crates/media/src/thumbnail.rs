@@ -5,14 +5,13 @@ use crate::decoder::VideoDecoder;
 const THUMB_WIDTH: u32 = 480;
 const THUMB_HEIGHT: u32 = 270;
 
-const PREVIEW_WIDTH: u32 = 960;
-const PREVIEW_HEIGHT: u32 = 540;
-
 pub fn extract_thumbnail(path: &Path) -> Option<image::RgbaImage> {
     let mut decoder = VideoDecoder::open(path).ok()?;
     decoder
-        .seek_and_decode(1.0, THUMB_WIDTH, THUMB_HEIGHT)
-        .or_else(|| decoder.seek_and_decode(0.0, THUMB_WIDTH, THUMB_HEIGHT))
+        .seek_and_decode(0.0, THUMB_WIDTH, THUMB_HEIGHT)
+        .or_else(|| decoder.seek_and_decode(0.04, THUMB_WIDTH, THUMB_HEIGHT))
+        .or_else(|| decoder.seek_and_decode(0.25, THUMB_WIDTH, THUMB_HEIGHT))
+        .or_else(|| decoder.seek_and_decode(1.0, THUMB_WIDTH, THUMB_HEIGHT))
 }
 
 pub fn extract_preview_frames(path: &Path, count: usize) -> Vec<image::RgbaImage> {
@@ -38,9 +37,4 @@ pub fn extract_preview_frames(path: &Path, count: usize) -> Vec<image::RgbaImage
         .collect();
 
     decoder.decode_frames_at_times(&times, THUMB_WIDTH, THUMB_HEIGHT)
-}
-
-pub fn extract_frame_at_time(path: &Path, time_seconds: f64) -> Option<image::RgbaImage> {
-    let mut decoder = VideoDecoder::open(path).ok()?;
-    decoder.seek_and_decode(time_seconds, PREVIEW_WIDTH, PREVIEW_HEIGHT)
 }

@@ -2,19 +2,6 @@ use std::path::Path;
 
 use crate::decoder::AudioDecoder;
 
-pub fn decode_pcm_snippet_f32_mono(
-    path: &Path,
-    start_seconds: f64,
-    duration_seconds: f64,
-    sample_rate_hz: u32,
-) -> Vec<f32> {
-    let mut decoder = match AudioDecoder::open(path) {
-        Ok(d) => d,
-        Err(_) => return Vec::new(),
-    };
-    decoder.decode_range_mono_f32(start_seconds, duration_seconds, sample_rate_hz)
-}
-
 pub fn extract_waveform_peaks(path: &Path, num_peaks: usize) -> Vec<(f32, f32)> {
     if num_peaks == 0 {
         return Vec::new();

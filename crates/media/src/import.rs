@@ -7,10 +7,16 @@ pub const VIDEO_EXTENSIONS: &[&str] = &[
 
 pub fn scan_folder(path: &Path) -> Vec<PathBuf> {
     let mut results = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(path) {
+    let mut stack = vec![path.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
         for entry in entries.flatten() {
             let p = entry.path();
-            if p.is_file() {
+            if p.is_dir() {
+                stack.push(p);
+            } else if p.is_file() {
                 if let Some(ext) = p.extension().and_then(|e| e.to_str()) {
                     if VIDEO_EXTENSIONS.contains(&ext.to_lowercase().as_str()) {
                         results.push(p);

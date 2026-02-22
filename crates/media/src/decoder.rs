@@ -46,7 +46,7 @@ struct ScalerState {
     out_height: u32,
 }
 
-fn init_once() {
+pub fn init_once() {
     use std::sync::Once;
     static INIT: Once = Once::new();
     INIT.call_once(|| {
@@ -108,12 +108,39 @@ impl VideoDecoder {
         target_width: u32,
         target_height: u32,
     ) -> Option<image::RgbaImage> {
-        let ts = (time_seconds.max(0.0) * 1_000_000.0) as i64;
+        let target_time = time_seconds.max(0.0);
+        let ts = (target_time * 1_000_000.0) as i64;
         let _ = self.format_ctx.seek(ts, ..);
         self.decoder.flush();
         self.last_decode_ts = None;
 
-        self.decode_next_video_frame_inner(target_width, target_height)
+        let mut best_before_target: Option<image::RgbaImage> = None;
+        let mut last_pts = f64::NEG_INFINITY;
+        let mut stagnant_pts_frames = 0_u32;
+        for _ in 0..180 {
+            let Some((img, pts)) = self.decode_next_video_frame_inner(target_width, target_height)
+            else {
+                break;
+            };
+            if (pts - last_pts).abs() < 1e-6 {
+                stagnant_pts_frames += 1;
+            } else {
+                stagnant_pts_frames = 0;
+                last_pts = pts;
+            }
+
+            // Some MPEG streams expose unreliable/non-advancing PTS around seeks.
+            // Bail out early instead of burning many frames and stalling scrub.
+            if stagnant_pts_frames >= 4 {
+                return Some(img);
+            }
+
+            if pts + 1e-6 >= target_time {
+                return Some(img);
+            }
+            best_before_target = Some(img);
+        }
+        best_before_target
     }
 
     pub fn decode_next_frame(
@@ -122,6 +149,7 @@ impl VideoDecoder {
         target_height: u32,
     ) -> Option<image::RgbaImage> {
         self.decode_next_video_frame_inner(target_width, target_height)
+            .map(|(img, _)| img)
     }
 
     pub fn last_decode_time(&self) -> Option<f64> {
@@ -138,7 +166,7 @@ impl VideoDecoder {
         &mut self,
         target_width: u32,
         target_height: u32,
-    ) -> Option<image::RgbaImage> {
+    ) -> Option<(image::RgbaImage, f64)> {
         let mut decoded_frame = VideoFrame::empty();
         let mut attempts = 0;
 
@@ -156,7 +184,9 @@ impl VideoDecoder {
                     return match self.decoder.receive_frame(&mut decoded_frame) {
                         Ok(_) => {
                             self.record_pts(&decoded_frame);
+                            let pts = self.last_decode_ts.unwrap_or(0.0);
                             self.convert_frame(&decoded_frame, target_width, target_height)
+                                .map(|img| (img, pts))
                         }
                         Err(_) => None,
                     };
@@ -175,11 +205,89 @@ impl VideoDecoder {
             match self.decoder.receive_frame(&mut decoded_frame) {
                 Ok(_) => {
                     self.record_pts(&decoded_frame);
-                    return self.convert_frame(&decoded_frame, target_width, target_height);
+                    let pts = self.last_decode_ts.unwrap_or(0.0);
+                    return self
+                        .convert_frame(&decoded_frame, target_width, target_height)
+                        .map(|img| (img, pts));
                 }
                 Err(_) => continue,
             }
         }
+    }
+
+    pub fn decode_gop_range(
+        &mut self,
+        start_seconds: f64,
+        end_seconds: f64,
+        target_width: u32,
+        target_height: u32,
+    ) -> Vec<(f64, Vec<u8>, u32, u32)> {
+        let ts = (start_seconds.max(0.0) * 1_000_000.0) as i64;
+        let _ = self.format_ctx.seek(ts, ..);
+        self.decoder.flush();
+        self.last_decode_ts = None;
+
+        let mut frames = Vec::new();
+        let mut decoded_frame = VideoFrame::empty();
+        let mut attempts = 0;
+
+        loop {
+            if attempts > 50000 {
+                break;
+            }
+            attempts += 1;
+
+            let mut packet = ffmpeg::Packet::empty();
+            match packet.read(&mut self.format_ctx) {
+                Ok(_) => {}
+                Err(ffmpeg::Error::Eof) => {
+                    let _ = self.decoder.send_eof();
+                    while self.decoder.receive_frame(&mut decoded_frame).is_ok() {
+                        let pts = decoded_frame
+                            .pts()
+                            .map(|p| p as f64 * self.time_base)
+                            .unwrap_or(0.0);
+                        if pts >= end_seconds {
+                            break;
+                        }
+                        if let Some(img) =
+                            self.convert_frame(&decoded_frame, target_width, target_height)
+                        {
+                            frames.push((pts, img.into_raw(), target_width, target_height));
+                        }
+                    }
+                    break;
+                }
+                Err(_) => break,
+            }
+
+            if packet.stream() != self.video_stream_index {
+                continue;
+            }
+
+            if self.decoder.send_packet(&packet).is_err() {
+                continue;
+            }
+
+            while self.decoder.receive_frame(&mut decoded_frame).is_ok() {
+                let pts = decoded_frame
+                    .pts()
+                    .map(|p| p as f64 * self.time_base)
+                    .unwrap_or(0.0);
+                if pts >= end_seconds {
+                    return frames;
+                }
+                if pts >= start_seconds {
+                    if let Some(img) =
+                        self.convert_frame(&decoded_frame, target_width, target_height)
+                    {
+                        frames.push((pts, img.into_raw(), target_width, target_height));
+                    }
+                }
+            }
+        }
+
+        frames
     }
 
     pub fn decode_frames_at_times(

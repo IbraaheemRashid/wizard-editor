@@ -1,11 +1,11 @@
 use egui::{pos2, vec2, Color32, CornerRadius, CursorIcon, DragAndDrop, Rect, Sense, Stroke};
 use wizard_state::clip::ClipId;
 use wizard_state::project::{AppState, TrimEdge, TrimState};
-use wizard_state::timeline::{TimelineClipId, TrackId, TrackKind};
+use wizard_state::timeline::{TrackId, TrackKind};
 
-use crate::browser::TextureLookup;
 use crate::theme;
 use crate::waveform_gpu::waveform_paint_callback;
+use crate::TextureLookup;
 
 const TRACK_HEIGHT: f32 = 60.0;
 const TRACK_HEADER_WIDTH: f32 = 60.0;
@@ -52,8 +52,51 @@ fn build_track_layout(state: &AppState) -> Vec<TrackLayout> {
     layouts
 }
 
+fn snap_time_to_clip_boundaries(
+    state: &AppState,
+    candidate_time: f64,
+    pps: f32,
+    exclude_clip: Option<wizard_state::timeline::TimelineClipId>,
+) -> (f64, bool) {
+    if pps <= 0.0 {
+        return (candidate_time.max(0.0), false);
+    }
+
+    let snap_threshold_time = (SNAP_THRESHOLD_PX / pps) as f64;
+    let mut best_time = candidate_time.max(0.0);
+    let mut best_dist = f64::INFINITY;
+
+    for track in state.project.timeline.all_tracks() {
+        for tc in &track.clips {
+            if exclude_clip.is_some_and(|id| id == tc.id) {
+                continue;
+            }
+            let start = tc.timeline_start;
+            let end = tc.timeline_start + tc.duration;
+
+            let start_dist = (candidate_time - start).abs();
+            if start_dist <= snap_threshold_time && start_dist < best_dist {
+                best_dist = start_dist;
+                best_time = start;
+            }
+
+            let end_dist = (candidate_time - end).abs();
+            if end_dist <= snap_threshold_time && end_dist < best_dist {
+                best_dist = end_dist;
+                best_time = end;
+            }
+        }
+    }
+
+    if best_dist.is_finite() {
+        (best_time.max(0.0), true)
+    } else {
+        (candidate_time.max(0.0), false)
+    }
+}
+
 pub fn timeline_panel(ui: &mut egui::Ui, state: &mut AppState, textures: &dyn TextureLookup) {
-    state.ui.timeline_scrubbing = None;
+    state.ui.timeline.scrubbing = None;
     ui.set_min_width(0.0);
     ui.set_min_height(0.0);
 
@@ -67,28 +110,52 @@ pub fn timeline_panel(ui: &mut egui::Ui, state: &mut AppState, textures: &dyn Te
     let content_left = timeline_rect.min.x + TRACK_HEADER_WIDTH;
     let content_width = timeline_rect.width() - TRACK_HEADER_WIDTH;
 
-    handle_zoom_scroll(ui, state, timeline_rect, content_left);
-    let pps = state.ui.timeline_zoom;
-    let scroll = state.ui.timeline_scroll_offset;
+    let track_layouts = build_track_layout(state);
+    let total_track_height = track_layouts.len() as f32 * (TRACK_HEIGHT + 2.0);
+    let available_track_height = timeline_rect.height() - RULER_HEIGHT - SCROLLBAR_HEIGHT - 8.0;
+    let needs_vertical_scroll = total_track_height > available_track_height;
+
+    handle_zoom_scroll(
+        ui,
+        state,
+        timeline_rect,
+        content_left,
+        needs_vertical_scroll,
+        total_track_height,
+        available_track_height,
+    );
+    let pps = state.ui.timeline.zoom;
+    let scroll = state.ui.timeline.scroll_offset;
+    let v_scroll = state.ui.timeline.vertical_scroll_offset;
+    let centered_block_offset = if needs_vertical_scroll {
+        0.0
+    } else {
+        (available_track_height - total_track_height).max(0.0) * 0.5
+    };
+    let ruler_top = timeline_rect.min.y + centered_block_offset;
 
     draw_ruler(
         ui,
         content_left,
-        timeline_rect.min.y,
+        ruler_top,
         content_width,
         pps,
         scroll,
     );
 
-    let tracks_top = timeline_rect.min.y + RULER_HEIGHT;
-    let track_layouts = build_track_layout(state);
+    let tracks_top = ruler_top + RULER_HEIGHT - v_scroll;
 
     let mut pending_browser_drop: Option<(ClipId, TrackId, f64)> = None;
 
-    let total_height = track_layouts.len() as f32 * (TRACK_HEIGHT + 2.0);
-    let content_clip_rect = Rect::from_min_size(
-        pos2(content_left, tracks_top),
-        vec2(content_width, total_height),
+    let clip_area_top = ruler_top + RULER_HEIGHT;
+    let clip_area_bottom = if needs_vertical_scroll {
+        (clip_area_top + available_track_height).min(timeline_rect.max.y - SCROLLBAR_HEIGHT - 8.0)
+    } else {
+        timeline_rect.max.y - SCROLLBAR_HEIGHT - 8.0
+    };
+    let content_clip_rect = Rect::from_min_max(
+        pos2(content_left, clip_area_top),
+        pos2(content_left + content_width, clip_area_bottom),
     );
     let content_painter = ui.painter().with_clip_rect(content_clip_rect);
 
@@ -150,7 +217,8 @@ pub fn timeline_panel(ui: &mut egui::Ui, state: &mut AppState, textures: &dyn Te
 
         if let Some(payload) = track_response.dnd_release_payload::<ClipId>() {
             if let Some(pointer) = ui.ctx().pointer_interact_pos() {
-                let t = ((pointer.x - content_left + scroll) / pps).max(0.0) as f64;
+                let drop_t = ((pointer.x - content_left + scroll) / pps).max(0.0) as f64;
+                let (t, _) = snap_time_to_clip_boundaries(state, drop_t, pps, None);
                 pending_browser_drop = Some((*payload, track_id, t));
             }
         }
@@ -196,32 +264,25 @@ pub fn timeline_panel(ui: &mut egui::Ui, state: &mut AppState, textures: &dyn Te
 
             let is_being_dragged = state
                 .ui
-                .timeline_dragging_clip
+                .timeline
+                .dragging_clip
                 .is_some_and(|id| id == tc_id);
 
             let mut drew_gpu_waveform = false;
 
             if layout.kind == TrackKind::Audio && gpu_waveforms_available {
                 if let Some(peaks) = textures.waveform_peaks(&tc_source_id) {
-                    let visible_peaks = if let Some(clip) = state.project.clips.get(&tc_source_id) {
-                        if let Some(total_dur) = clip.duration {
-                            if total_dur > 0.0 {
-                                let in_frac = tc.source_in / total_dur;
-                                let out_frac = tc.source_out / total_dur;
-                                let start_idx = (in_frac * peaks.len() as f64) as usize;
-                                let end_idx = (out_frac * peaks.len() as f64) as usize;
-                                &peaks[start_idx.min(peaks.len())..end_idx.min(peaks.len())]
-                            } else {
-                                peaks.as_slice()
-                            }
-                        } else {
-                            peaks.as_slice()
-                        }
-                    } else {
-                        peaks.as_slice()
-                    };
-                    let wave_color =
-                        Color32::from_rgba_unmultiplied(180, 255, 200, 240);
+                    let visible_peaks = visible_peak_slice(
+                        peaks,
+                        tc.source_in,
+                        tc.source_out,
+                        state
+                            .project
+                            .clips
+                            .get(&tc_source_id)
+                            .and_then(|c| c.duration),
+                    );
+                    let wave_color = theme::WAVEFORM_COLOR;
                     content_painter.add(waveform_paint_callback(
                         clip_rect,
                         visible_peaks,
@@ -237,68 +298,72 @@ pub fn timeline_panel(ui: &mut egui::Ui, state: &mut AppState, textures: &dyn Te
                 content_painter.rect_filled(clip_rect, theme::ROUNDING_SM, clip_color);
             }
 
-            if layout.kind == TrackKind::Video {
-                let thumb_w = THUMB_WIDTH.min(clip_w);
-                let thumb_rect =
-                    Rect::from_min_size(pos2(clip_x, y + 2.0), vec2(thumb_w, TRACK_HEIGHT - 4.0));
+            if layout.kind == TrackKind::Video && clip_w >= 20.0 {
                 if let Some(tex) = textures.thumbnail(&tc_source_id) {
-                    let uv = Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+                    let thumb_w = THUMB_WIDTH.min(clip_w);
+                    let thumb_rect = Rect::from_min_size(
+                        pos2(clip_x, y + 2.0),
+                        vec2(thumb_w, TRACK_HEIGHT - 4.0),
+                    );
+                    let uv = center_crop_uv(tex, TRACK_HEIGHT - 4.0, thumb_w);
                     content_painter.image(tex.id(), thumb_rect, uv, Color32::WHITE);
                 }
             } else if layout.kind == TrackKind::Audio && !drew_gpu_waveform {
                 if let Some(peaks) = textures.waveform_peaks(&tc_source_id) {
-                    let visible_peaks = if let Some(clip) = state.project.clips.get(&tc_source_id) {
-                        if let Some(total_dur) = clip.duration {
-                            if total_dur > 0.0 {
-                                let in_frac = tc.source_in / total_dur;
-                                let out_frac = tc.source_out / total_dur;
-                                let start_idx = (in_frac * peaks.len() as f64) as usize;
-                                let end_idx = (out_frac * peaks.len() as f64) as usize;
-                                &peaks[start_idx.min(peaks.len())..end_idx.min(peaks.len())]
-                            } else {
-                                peaks.as_slice()
-                            }
-                        } else {
-                            peaks.as_slice()
-                        }
-                    } else {
-                        peaks.as_slice()
-                    };
-                    draw_waveform(&content_painter, clip_rect, visible_peaks, clip_color);
+                    let visible_peaks = visible_peak_slice(
+                        peaks,
+                        tc.source_in,
+                        tc.source_out,
+                        state
+                            .project
+                            .clips
+                            .get(&tc_source_id)
+                            .and_then(|c| c.duration),
+                    );
+                    draw_waveform(&content_painter, clip_rect, visible_peaks);
                 }
             }
 
-            if let Some(clip) = state.project.clips.get(&tc_source_id) {
-                let name = clip.display_name();
-                let label = if name.len() > 15 {
-                    format!("{}...", &name[..12])
-                } else {
-                    name.to_string()
-                };
-                let label_rect = Rect::from_min_size(
-                    pos2(clip_rect.min.x, clip_rect.max.y - 14.0),
-                    vec2(clip_w.min(clip_rect.width()), 14.0),
-                );
-                content_painter.rect_filled(
-                    label_rect,
-                    CornerRadius::ZERO,
-                    Color32::from_black_alpha(160),
-                );
-                content_painter.text(
-                    pos2(clip_rect.min.x + 4.0, clip_rect.max.y - 7.0),
-                    egui::Align2::LEFT_CENTER,
-                    label,
-                    egui::FontId::proportional(10.0),
-                    Color32::WHITE,
-                );
+            if clip_w >= 30.0 {
+                if let Some(clip) = state.project.clips.get(&tc_source_id) {
+                    let name = clip.display_name();
+                    let label = if name.len() > 15 {
+                        format!("{}...", &name[..12])
+                    } else {
+                        name.to_string()
+                    };
+                    let label_rect = Rect::from_min_size(
+                        pos2(clip_rect.min.x, clip_rect.max.y - 14.0),
+                        vec2(clip_w.min(clip_rect.width()), 14.0),
+                    );
+                    content_painter.rect_filled(
+                        label_rect,
+                        CornerRadius::ZERO,
+                        Color32::from_black_alpha(160),
+                    );
+                    content_painter.text(
+                        pos2(clip_rect.min.x + 4.0, clip_rect.max.y - 7.0),
+                        egui::Align2::LEFT_CENTER,
+                        label,
+                        egui::FontId::proportional(10.0),
+                        Color32::WHITE,
+                    );
+                }
             }
 
-            if state.project.starred.contains(&tc_source_id) {
+            if clip_w > 25.0 && state.project.starred.contains(&tc_source_id) {
+                let star_pos = clip_rect.left_top() + vec2(4.0, 2.0);
+                let pill_rect = Rect::from_min_size(star_pos, vec2(16.0, 14.0));
+                content_painter.rect_filled(
+                    pill_rect,
+                    CornerRadius::same(3),
+                    Color32::from_black_alpha(140),
+                );
                 content_painter.text(
-                    clip_rect.right_top() + vec2(-12.0, 2.0),
-                    egui::Align2::CENTER_TOP,
+                    star_pos + vec2(8.0, 7.0),
+                    egui::Align2::CENTER_CENTER,
                     "\u{2605}",
-                    egui::FontId::proportional(10.0),
+                    egui::FontId::proportional(12.0),
                     theme::STAR_COLOR,
                 );
             }
@@ -321,20 +386,21 @@ pub fn timeline_panel(ui: &mut egui::Ui, state: &mut AppState, textures: &dyn Te
             }
 
             let hover_pos = ui.ctx().pointer_hover_pos();
+            let effective_trim_w = TRIM_HANDLE_WIDTH.min(clip_w / 3.0);
             let hover_on_left = hover_pos.is_some_and(|p| {
                 p.y >= clip_rect.min.y
                     && p.y <= clip_rect.max.y
-                    && (p.x - clip_rect.min.x).abs() < TRIM_HANDLE_WIDTH
+                    && (p.x - clip_rect.min.x).abs() < effective_trim_w
             });
             let hover_on_right = hover_pos.is_some_and(|p| {
                 p.y >= clip_rect.min.y
                     && p.y <= clip_rect.max.y
-                    && (p.x - clip_rect.max.x).abs() < TRIM_HANDLE_WIDTH
+                    && (p.x - clip_rect.max.x).abs() < effective_trim_w
             });
 
             if (hover_on_left || hover_on_right)
-                && state.ui.trimming_clip.is_none()
-                && state.ui.timeline_dragging_clip.is_none()
+                && state.ui.timeline.trimming_clip.is_none()
+                && state.ui.timeline.dragging_clip.is_none()
             {
                 ui.ctx().set_cursor_icon(CursorIcon::ResizeHorizontal);
             }
@@ -349,10 +415,10 @@ pub fn timeline_panel(ui: &mut egui::Ui, state: &mut AppState, textures: &dyn Te
                 let origin = clip_response.interact_pointer_pos().unwrap_or_default();
                 let origin_on_left = origin.y >= clip_rect.min.y
                     && origin.y <= clip_rect.max.y
-                    && (origin.x - clip_rect.min.x).abs() < TRIM_HANDLE_WIDTH;
+                    && (origin.x - clip_rect.min.x).abs() < effective_trim_w;
                 let origin_on_right = origin.y >= clip_rect.min.y
                     && origin.y <= clip_rect.max.y
-                    && (origin.x - clip_rect.max.x).abs() < TRIM_HANDLE_WIDTH;
+                    && (origin.x - clip_rect.max.x).abs() < effective_trim_w;
 
                 if origin_on_left || origin_on_right {
                     let edge = if origin_on_left {
@@ -360,7 +426,7 @@ pub fn timeline_panel(ui: &mut egui::Ui, state: &mut AppState, textures: &dyn Te
                     } else {
                         TrimEdge::Right
                     };
-                    state.ui.trimming_clip = Some(TrimState {
+                    state.ui.timeline.trimming_clip = Some(TrimState {
                         clip_id: tc_id,
                         edge,
                         original_position: tc.timeline_start,
@@ -369,11 +435,11 @@ pub fn timeline_panel(ui: &mut egui::Ui, state: &mut AppState, textures: &dyn Te
                         original_out_point: tc.source_out,
                     });
                 } else {
-                    state.ui.timeline_dragging_clip = Some(tc_id);
+                    state.ui.timeline.dragging_clip = Some(tc_id);
                 }
             }
 
-            if clip_response.clicked() && state.ui.trimming_clip.is_none() {
+            if clip_response.clicked() && state.ui.timeline.trimming_clip.is_none() {
                 state.ui.selection.selected_timeline_clip = Some(tc_id);
                 state.ui.selection.selected_clip = Some(tc_source_id);
             }
@@ -388,16 +454,7 @@ pub fn timeline_panel(ui: &mut egui::Ui, state: &mut AppState, textures: &dyn Te
 
     let total_tracks = state.project.timeline.track_count();
 
-    draw_drag_ghosts(
-        ui,
-        state,
-        tracks_top,
-        content_left,
-        content_width,
-        pps,
-        scroll,
-        textures,
-    );
+    draw_drag_ghosts(ui, state, tracks_top, content_left, pps, scroll, textures);
 
     handle_clip_trim(ui, state, content_left, pps, scroll, tracks_top);
     handle_clip_drag_drop(ui, state, tracks_top, content_left, pps, scroll);
@@ -406,7 +463,7 @@ pub fn timeline_panel(ui: &mut egui::Ui, state: &mut AppState, textures: &dyn Te
     let mut playhead_x = content_left + playhead_time as f32 * pps - scroll;
 
     let scrub_rect = Rect::from_min_size(
-        pos2(content_left, timeline_rect.min.y),
+        pos2(content_left, ruler_top),
         vec2(content_width, RULER_HEIGHT),
     );
     let scrub_response = ui.interact(
@@ -416,32 +473,11 @@ pub fn timeline_panel(ui: &mut egui::Ui, state: &mut AppState, textures: &dyn Te
     );
     if scrub_response.dragged() || scrub_response.clicked() {
         if let Some(pointer) = scrub_response.interact_pointer_pos() {
-            let mut t = ((pointer.x - content_left + scroll) / pps).max(0.0) as f64;
-
-            let snap_threshold_time = (SNAP_THRESHOLD_PX / pps) as f64;
-            let mut snapped = false;
-            for track in state.project.timeline.all_tracks() {
-                for tc in &track.clips {
-                    let start = tc.timeline_start;
-                    let end = tc.timeline_start + tc.duration;
-                    if (t - start).abs() < snap_threshold_time {
-                        t = start;
-                        snapped = true;
-                        break;
-                    }
-                    if (t - end).abs() < snap_threshold_time {
-                        t = end;
-                        snapped = true;
-                        break;
-                    }
-                }
-                if snapped {
-                    break;
-                }
-            }
+            let raw_t = ((pointer.x - content_left + scroll) / pps).max(0.0) as f64;
+            let (t, snapped) = snap_time_to_clip_boundaries(state, raw_t, pps, None);
 
             state.project.playback.playhead = t;
-            state.ui.timeline_scrubbing = Some(t);
+            state.ui.timeline.scrubbing = Some(t);
             playhead_x = content_left + t as f32 * pps - scroll;
 
             if snapped {
@@ -462,7 +498,7 @@ pub fn timeline_panel(ui: &mut egui::Ui, state: &mut AppState, textures: &dyn Te
         }
     }
 
-    let playhead_top = timeline_rect.min.y;
+    let playhead_top = ruler_top;
     let playhead_bottom = tracks_top + total_tracks as f32 * (TRACK_HEIGHT + 2.0);
     let playhead_clip = Rect::from_min_max(
         pos2(content_left, playhead_top),
@@ -479,8 +515,7 @@ pub fn timeline_panel(ui: &mut egui::Ui, state: &mut AppState, textures: &dyn Te
 
     let playhead_head =
         Rect::from_center_size(pos2(playhead_x, playhead_top + 4.0), vec2(10.0, 8.0));
-    playhead_painter
-        .rect_filled(playhead_head, CornerRadius::same(2), theme::PLAYHEAD_COLOR);
+    playhead_painter.rect_filled(playhead_head, CornerRadius::same(2), theme::PLAYHEAD_COLOR);
 
     draw_scrollbar(
         ui,
@@ -491,6 +526,44 @@ pub fn timeline_panel(ui: &mut egui::Ui, state: &mut AppState, textures: &dyn Te
     );
 }
 
+fn center_crop_uv(tex: &egui::TextureHandle, display_h: f32, display_w: f32) -> Rect {
+    let tex_size = tex.size();
+    let tex_w = tex_size[0] as f32;
+    let tex_h = tex_size[1] as f32;
+    if tex_w == 0.0 || tex_h == 0.0 || display_w == 0.0 || display_h == 0.0 {
+        return Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+    }
+    let tex_aspect = tex_w / tex_h;
+    let display_aspect = display_w / display_h;
+    if display_aspect > tex_aspect {
+        let crop_h = tex_aspect / display_aspect;
+        let margin = (1.0 - crop_h) / 2.0;
+        Rect::from_min_max(egui::pos2(0.0, margin), egui::pos2(1.0, 1.0 - margin))
+    } else {
+        let crop_w = display_aspect / tex_aspect;
+        let margin = (1.0 - crop_w) / 2.0;
+        Rect::from_min_max(egui::pos2(margin, 0.0), egui::pos2(1.0 - margin, 1.0))
+    }
+}
+
+fn visible_peak_slice(
+    peaks: &[(f32, f32)],
+    source_in: f64,
+    source_out: f64,
+    source_duration: Option<f64>,
+) -> &[(f32, f32)] {
+    if let Some(total_dur) = source_duration {
+        if total_dur > 0.0 {
+            let in_frac = source_in / total_dur;
+            let out_frac = source_out / total_dur;
+            let start_idx = (in_frac * peaks.len() as f64) as usize;
+            let end_idx = (out_frac * peaks.len() as f64) as usize;
+            return &peaks[start_idx.min(peaks.len())..end_idx.min(peaks.len())];
+        }
+    }
+    peaks
+}
+
 fn handle_clip_trim(
     ui: &egui::Ui,
     state: &mut AppState,
@@ -499,99 +572,16 @@ fn handle_clip_trim(
     scroll: f32,
     tracks_top: f32,
 ) {
-    let Some(ref trim) = state.ui.trimming_clip else {
+    let Some(ref trim) = state.ui.timeline.trimming_clip else {
         return;
     };
 
     let is_dragging = ui.input(|i| i.pointer.any_down());
     if !is_dragging {
         let trim_clip_id = trim.clip_id;
-        state.ui.trimming_clip = None;
+        state.ui.timeline.trimming_clip = None;
 
-        if let Some((track, clip_idx, _)) = state.project.timeline.find_clip(trim_clip_id) {
-            let tc = &track.clips[clip_idx];
-            let start = tc.timeline_start;
-            let end = tc.timeline_start + tc.duration;
-            let track_id = track.id;
-
-            let track = state
-                .project
-                .timeline
-                .track_by_id_mut(track_id)
-                .expect("track exists");
-            let idx_to_skip = track
-                .clips
-                .iter()
-                .position(|c| c.id == trim_clip_id)
-                .expect("clip exists");
-
-            let mut i = 0;
-            let mut splits: Vec<wizard_state::timeline::TimelineClip> = Vec::new();
-            while i < track.clips.len() {
-                if i == idx_to_skip {
-                    i += 1;
-                    continue;
-                }
-                let c = &track.clips[i];
-                let c_start = c.timeline_start;
-                let c_end = c.timeline_start + c.duration;
-
-                if c_end <= start || c_start >= end {
-                    i += 1;
-                    continue;
-                }
-
-                if c_start >= start && c_end <= end {
-                    track.clips.remove(i);
-                    continue;
-                }
-
-                if c_start < start && c_end > end {
-                    let left_duration = start - c_start;
-                    let right_duration = c_end - end;
-                    let right_in = c.source_in + (end - c_start);
-
-                    let right = wizard_state::timeline::TimelineClip {
-                        id: TimelineClipId::new(),
-                        source_id: c.source_id,
-                        track_id: c.track_id,
-                        timeline_start: end,
-                        duration: right_duration,
-                        source_in: right_in,
-                        source_out: c.source_out,
-                        linked_to: None,
-                    };
-                    splits.push(right);
-
-                    let c = &mut track.clips[i];
-                    c.duration = left_duration;
-                    c.source_out = c.source_in + left_duration;
-                    i += 1;
-                    continue;
-                }
-
-                if c_start < start {
-                    let c = &mut track.clips[i];
-                    let trimmed = c_end - start;
-                    c.duration -= trimmed;
-                    c.source_out -= trimmed;
-                    i += 1;
-                    continue;
-                }
-
-                let trim_amount = end - c_start;
-                let c = &mut track.clips[i];
-                c.source_in += trim_amount;
-                c.timeline_start = end;
-                c.duration -= trim_amount;
-                i += 1;
-            }
-            track.clips.extend(splits);
-        }
-        state
-            .project
-            .timeline
-            .sync_linked_clip_after_trim(trim_clip_id);
+        state.project.timeline.finalize_trim(trim_clip_id);
         return;
     }
 
@@ -608,8 +598,15 @@ fn handle_clip_trim(
     let original_duration = trim.original_duration;
     let original_in_point = trim.original_in_point;
     let original_out_point = trim.original_out_point;
-
-    let source_duration = original_out_point - original_in_point + original_duration;
+    let source_clip_duration = state
+        .project
+        .timeline
+        .find_clip(trim_clip_id)
+        .and_then(|(_, _, tc)| state.project.clips.get(&tc.source_id))
+        .and_then(|clip| clip.duration);
+    let max_source_out = source_clip_duration.unwrap_or(original_out_point.max(
+        original_in_point + original_duration,
+    ));
 
     if let Some((track, clip_idx)) = state.project.timeline.find_clip_track_mut(trim_clip_id) {
         let tc = &mut track.clips[clip_idx];
@@ -618,7 +615,7 @@ fn handle_clip_trim(
                 let new_out = pointer_time - original_position + original_in_point;
                 let clamped_out = new_out
                     .max(original_in_point + MIN_CLIP_DURATION)
-                    .min(source_duration);
+                    .min(max_source_out);
                 tc.source_out = clamped_out;
                 tc.duration = clamped_out - tc.source_in;
             }
@@ -647,7 +644,7 @@ fn handle_clip_trim(
             Stroke::new(2.0, theme::ACCENT),
         );
     }
-    state.project.timeline.sync_linked_clip(trim_clip_id);
+    state.project.timeline.sync_linked_clip(trim_clip_id, false);
 }
 
 fn handle_clip_drag_drop(
@@ -658,7 +655,7 @@ fn handle_clip_drag_drop(
     pps: f32,
     scroll: f32,
 ) {
-    let Some(src_clip_id) = state.ui.timeline_dragging_clip else {
+    let Some(src_clip_id) = state.ui.timeline.dragging_clip else {
         return;
     };
 
@@ -667,7 +664,7 @@ fn handle_clip_drag_drop(
         return;
     }
 
-    state.ui.timeline_dragging_clip = None;
+    state.ui.timeline.dragging_clip = None;
 
     let Some(pointer) = ui.input(|i| i.pointer.hover_pos()) else {
         return;
@@ -697,6 +694,7 @@ fn handle_clip_drag_drop(
     }
 
     let new_pos = ((pointer.x - content_left + scroll) / pps).max(0.0) as f64;
+    let (new_pos, _) = snap_time_to_clip_boundaries(state, new_pos, pps, Some(src_clip_id));
 
     if src_track_id == dst_track_id {
         state
@@ -712,12 +710,12 @@ fn handle_clip_drag_drop(
     state.ui.selection.selected_timeline_clip = None;
 }
 
-fn draw_waveform(painter: &egui::Painter, rect: Rect, peaks: &[(f32, f32)], _base_color: Color32) {
+fn draw_waveform(painter: &egui::Painter, rect: Rect, peaks: &[(f32, f32)]) {
     if peaks.is_empty() {
         return;
     }
 
-    let wave_color = Color32::from_rgba_unmultiplied(180, 255, 200, 240);
+    let wave_color = theme::WAVEFORM_COLOR;
 
     let center_y = rect.center().y;
     let half_h = rect.height() * 0.45;
@@ -747,8 +745,8 @@ fn draw_scrollbar(ui: &mut egui::Ui, state: &mut AppState, left: f32, width: f32
     ui.painter()
         .rect_filled(scrollbar_rect, CornerRadius::ZERO, theme::RULER_BG);
 
-    let pps = state.ui.timeline_zoom;
-    let scroll = state.ui.timeline_scroll_offset;
+    let pps = state.ui.timeline.zoom;
+    let scroll = state.ui.timeline.scroll_offset;
 
     let mut total_duration: f64 = 10.0;
     for track in state.project.timeline.all_tracks() {
@@ -785,7 +783,7 @@ fn draw_scrollbar(ui: &mut egui::Ui, state: &mut AppState, left: f32, width: f32
         if let Some(pointer) = response.interact_pointer_pos() {
             let frac = ((pointer.x - left) / width).clamp(0.0, 1.0);
             let max_scroll = (total_width - width).max(0.0);
-            state.ui.timeline_scroll_offset = frac * max_scroll;
+            state.ui.timeline.scroll_offset = frac * max_scroll;
         }
     }
 }
@@ -795,6 +793,9 @@ fn handle_zoom_scroll(
     state: &mut AppState,
     timeline_rect: Rect,
     content_left: f32,
+    needs_vertical_scroll: bool,
+    total_track_height: f32,
+    available_track_height: f32,
 ) {
     let hover_pos = ui.input(|i| i.pointer.hover_pos());
     let in_timeline = hover_pos.is_some_and(|p| timeline_rect.contains(p));
@@ -805,34 +806,60 @@ fn handle_zoom_scroll(
     let zoom_delta = ui.input(|i| i.zoom_delta());
 
     if zoom_delta != 1.0 {
-        let old_zoom = state.ui.timeline_zoom;
+        let old_zoom = state.ui.timeline.zoom;
         let new_zoom = (old_zoom * zoom_delta).clamp(ZOOM_MIN, ZOOM_MAX);
 
         if let Some(pointer) = hover_pos {
             let pointer_time =
-                (pointer.x - content_left + state.ui.timeline_scroll_offset) / old_zoom;
-            state.ui.timeline_zoom = new_zoom;
-            state.ui.timeline_scroll_offset =
+                (pointer.x - content_left + state.ui.timeline.scroll_offset) / old_zoom;
+            state.ui.timeline.zoom = new_zoom;
+            state.ui.timeline.scroll_offset =
                 (pointer_time * new_zoom - (pointer.x - content_left)).max(0.0);
         } else {
-            state.ui.timeline_zoom = new_zoom;
+            state.ui.timeline.zoom = new_zoom;
         }
     } else {
         let scroll_delta = ui.input(|i| i.smooth_scroll_delta);
         if scroll_delta.x.abs() > 0.1 {
-            state.ui.timeline_scroll_offset =
-                (state.ui.timeline_scroll_offset - scroll_delta.x).max(0.0);
+            state.ui.timeline.scroll_offset =
+                (state.ui.timeline.scroll_offset - scroll_delta.x).max(0.0);
+        }
+
+        if scroll_delta.y.abs() > 0.1 {
+            if needs_vertical_scroll {
+                let max_v_scroll = (total_track_height - available_track_height).max(0.0);
+                state.ui.timeline.vertical_scroll_offset =
+                    (state.ui.timeline.vertical_scroll_offset - scroll_delta.y)
+                        .clamp(0.0, max_v_scroll);
+            } else {
+                state.ui.timeline.scroll_offset =
+                    (state.ui.timeline.scroll_offset - scroll_delta.y).max(0.0);
+            }
         }
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+struct ClipGhostParams<'a> {
+    clip_id: &'a ClipId,
+    duration: f64,
+    drop_time: f64,
+    track_y: f32,
+    content_left: f32,
+    pps: f32,
+    scroll: f32,
+    clip_color: Color32,
+    track_kind: TrackKind,
+    tracks_top: f32,
+    num_tracks: usize,
+    state: &'a AppState,
+    textures: &'a dyn TextureLookup,
+}
+
 fn draw_drag_ghosts(
     ui: &mut egui::Ui,
     state: &AppState,
     tracks_top: f32,
     content_left: f32,
-    content_width: f32,
     pps: f32,
     scroll: f32,
     textures: &dyn TextureLookup,
@@ -858,7 +885,7 @@ fn draw_drag_ghosts(
     let target_kind = track_layouts[target_display_idx].kind;
     let drop_time = ((pointer.x - content_left + scroll) / pps).max(0.0) as f64;
 
-    let has_timeline_drag = state.ui.timeline_dragging_clip.is_some();
+    let has_timeline_drag = state.ui.timeline.dragging_clip.is_some();
 
     let paired_track_id = track_layouts[target_display_idx].track_id;
     let paired_id = state.project.timeline.paired_track_id(paired_track_id);
@@ -882,20 +909,21 @@ fn draw_drag_ghosts(
             let track_y = tracks_top + target_display_idx as f32 * (TRACK_HEIGHT + 2.0);
             draw_clip_ghost(
                 ui,
-                &clip_id,
-                duration,
-                drop_time,
-                track_y,
-                content_left,
-                content_width,
-                pps,
-                scroll,
-                clip_color,
-                target_kind,
-                tracks_top,
-                num_tracks,
-                state,
-                textures,
+                &ClipGhostParams {
+                    clip_id: &clip_id,
+                    duration,
+                    drop_time,
+                    track_y,
+                    content_left,
+                    pps,
+                    scroll,
+                    clip_color,
+                    track_kind: target_kind,
+                    tracks_top,
+                    num_tracks,
+                    state,
+                    textures,
+                },
             );
             if let Some(p_idx) = paired_display_idx {
                 let paired_kind = track_layouts[p_idx].kind;
@@ -906,26 +934,27 @@ fn draw_drag_ghosts(
                 let paired_y = tracks_top + p_idx as f32 * (TRACK_HEIGHT + 2.0);
                 draw_clip_ghost(
                     ui,
-                    &clip_id,
-                    duration,
-                    drop_time,
-                    paired_y,
-                    content_left,
-                    content_width,
-                    pps,
-                    scroll,
-                    paired_color,
-                    paired_kind,
-                    tracks_top,
-                    num_tracks,
-                    state,
-                    textures,
+                    &ClipGhostParams {
+                        clip_id: &clip_id,
+                        duration,
+                        drop_time,
+                        track_y: paired_y,
+                        content_left,
+                        pps,
+                        scroll,
+                        clip_color: paired_color,
+                        track_kind: paired_kind,
+                        tracks_top,
+                        num_tracks,
+                        state,
+                        textures,
+                    },
                 );
             }
         }
     }
 
-    if let Some(src_clip_id) = state.ui.timeline_dragging_clip {
+    if let Some(src_clip_id) = state.ui.timeline.dragging_clip {
         let is_dragging = ui.input(|i| i.pointer.any_down());
         if is_dragging {
             if let Some((_, _, tc)) = state.project.timeline.find_clip(src_clip_id) {
@@ -945,20 +974,21 @@ fn draw_drag_ghosts(
                 let track_y = tracks_top + target_display_idx as f32 * (TRACK_HEIGHT + 2.0);
                 draw_clip_ghost(
                     ui,
-                    &clip_id,
-                    duration,
-                    drop_time,
-                    track_y,
-                    content_left,
-                    content_width,
-                    pps,
-                    scroll,
-                    clip_color,
-                    target_kind,
-                    tracks_top,
-                    num_tracks,
-                    state,
-                    textures,
+                    &ClipGhostParams {
+                        clip_id: &clip_id,
+                        duration,
+                        drop_time,
+                        track_y,
+                        content_left,
+                        pps,
+                        scroll,
+                        clip_color,
+                        track_kind: target_kind,
+                        tracks_top,
+                        num_tracks,
+                        state,
+                        textures,
+                    },
                 );
                 if let Some(lid) = linked_id {
                     if let Some((linked_track, _, _)) = state.project.timeline.find_clip(lid) {
@@ -973,20 +1003,21 @@ fn draw_drag_ghosts(
                             let linked_y = tracks_top + l_idx as f32 * (TRACK_HEIGHT + 2.0);
                             draw_clip_ghost(
                                 ui,
-                                &clip_id,
-                                duration,
-                                drop_time,
-                                linked_y,
-                                content_left,
-                                content_width,
-                                pps,
-                                scroll,
-                                linked_color,
-                                lt_kind,
-                                tracks_top,
-                                num_tracks,
-                                state,
-                                textures,
+                                &ClipGhostParams {
+                                    clip_id: &clip_id,
+                                    duration,
+                                    drop_time,
+                                    track_y: linked_y,
+                                    content_left,
+                                    pps,
+                                    scroll,
+                                    clip_color: linked_color,
+                                    track_kind: lt_kind,
+                                    tracks_top,
+                                    num_tracks,
+                                    state,
+                                    textures,
+                                },
                             );
                         }
                     }
@@ -996,33 +1027,16 @@ fn draw_drag_ghosts(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn draw_clip_ghost(
-    ui: &mut egui::Ui,
-    clip_id: &ClipId,
-    duration: f64,
-    drop_time: f64,
-    track_y: f32,
-    content_left: f32,
-    _content_width: f32,
-    pps: f32,
-    scroll: f32,
-    clip_color: Color32,
-    track_kind: TrackKind,
-    tracks_top: f32,
-    num_tracks: usize,
-    state: &AppState,
-    textures: &dyn TextureLookup,
-) {
-    let ghost_x = content_left + drop_time as f32 * pps - scroll;
-    let ghost_w = duration as f32 * pps;
+fn draw_clip_ghost(ui: &mut egui::Ui, p: &ClipGhostParams<'_>) {
+    let ghost_x = p.content_left + p.drop_time as f32 * p.pps - p.scroll;
+    let ghost_w = p.duration as f32 * p.pps;
     let ghost_rect = Rect::from_min_size(
-        pos2(ghost_x, track_y + 2.0),
+        pos2(ghost_x, p.track_y + 2.0),
         vec2(ghost_w, TRACK_HEIGHT - 4.0),
     );
 
     let ghost_color =
-        Color32::from_rgba_unmultiplied(clip_color.r(), clip_color.g(), clip_color.b(), 100);
+        Color32::from_rgba_unmultiplied(p.clip_color.r(), p.clip_color.g(), p.clip_color.b(), 100);
     ui.painter()
         .rect_filled(ghost_rect, theme::ROUNDING_SM, ghost_color);
 
@@ -1033,20 +1047,20 @@ fn draw_clip_ghost(
         egui::StrokeKind::Outside,
     );
 
-    if track_kind == TrackKind::Video {
+    if p.track_kind == TrackKind::Video {
         let thumb_w = THUMB_WIDTH.min(ghost_w);
         let thumb_rect = Rect::from_min_size(
-            pos2(ghost_x, track_y + 2.0),
+            pos2(ghost_x, p.track_y + 2.0),
             vec2(thumb_w, TRACK_HEIGHT - 4.0),
         );
-        if let Some(tex) = textures.thumbnail(clip_id) {
+        if let Some(tex) = p.textures.thumbnail(p.clip_id) {
             let uv = Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
             let tint = Color32::from_rgba_unmultiplied(255, 255, 255, 100);
             ui.painter().image(tex.id(), thumb_rect, uv, tint);
         }
     }
 
-    if let Some(clip) = state.project.clips.get(clip_id) {
+    if let Some(clip) = p.state.project.clips.get(p.clip_id) {
         let name = clip.display_name();
         let label = if name.len() > 15 {
             format!("{}...", &name[..12])
@@ -1062,19 +1076,19 @@ fn draw_clip_ghost(
         );
     }
 
-    let line_top = tracks_top;
-    let line_bottom = tracks_top + num_tracks as f32 * (TRACK_HEIGHT + 2.0);
+    let line_top = p.tracks_top;
+    let line_bottom = p.tracks_top + p.num_tracks as f32 * (TRACK_HEIGHT + 2.0);
     ui.painter().line_segment(
         [pos2(ghost_x, line_top), pos2(ghost_x, line_bottom)],
         Stroke::new(1.0, Color32::from_white_alpha(120)),
     );
 
-    let total_secs = drop_time;
+    let total_secs = p.drop_time;
     let minutes = (total_secs / 60.0).floor() as i32;
     let secs = total_secs % 60.0;
     let time_label = format!("{minutes}:{secs:04.1}");
     ui.painter().text(
-        pos2(ghost_x + 2.0, track_y - 2.0),
+        pos2(ghost_x + 2.0, p.track_y - 2.0),
         egui::Align2::LEFT_BOTTOM,
         time_label,
         egui::FontId::monospace(9.0),

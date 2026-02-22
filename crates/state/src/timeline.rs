@@ -128,14 +128,19 @@ impl Track {
         }
 
         self.clips.extend(splits);
+        self.clips
+            .sort_by(|a, b| a.timeline_start.total_cmp(&b.timeline_start));
     }
 }
 
+#[derive(Debug, Clone)]
 pub struct PlayheadHit {
     pub track_id: TrackId,
     pub clip: TimelineClip,
     pub source_time: f64,
 }
+
+pub const DEFAULT_TRACK_PAIRS: usize = 3;
 
 #[derive(Debug, Clone)]
 pub struct Timeline {
@@ -145,17 +150,15 @@ pub struct Timeline {
 
 impl Timeline {
     pub fn new() -> Self {
+        let video_tracks = (1..=DEFAULT_TRACK_PAIRS)
+            .map(|n| Track::new(format!("V{n}"), TrackKind::Video))
+            .collect();
+        let audio_tracks = (1..=DEFAULT_TRACK_PAIRS)
+            .map(|n| Track::new(format!("A{n}"), TrackKind::Audio))
+            .collect();
         Self {
-            video_tracks: vec![
-                Track::new("V1", TrackKind::Video),
-                Track::new("V2", TrackKind::Video),
-                Track::new("V3", TrackKind::Video),
-            ],
-            audio_tracks: vec![
-                Track::new("A1", TrackKind::Audio),
-                Track::new("A2", TrackKind::Audio),
-                Track::new("A3", TrackKind::Audio),
-            ],
+            video_tracks,
+            audio_tracks,
         }
     }
 
@@ -220,8 +223,11 @@ impl Timeline {
         None
     }
 
-    pub fn clip_at_time(&self, time: f64) -> Option<PlayheadHit> {
-        for track in self.all_tracks() {
+    fn clip_at_time_in<'a>(
+        tracks: impl Iterator<Item = &'a Track>,
+        time: f64,
+    ) -> Option<PlayheadHit> {
+        for track in tracks {
             for tc in &track.clips {
                 if time >= tc.timeline_start && time < tc.timeline_start + tc.duration {
                     let source_time = tc.source_in + (time - tc.timeline_start);
@@ -236,20 +242,12 @@ impl Timeline {
         None
     }
 
+    pub fn clip_at_time(&self, time: f64) -> Option<PlayheadHit> {
+        Self::clip_at_time_in(self.all_tracks(), time)
+    }
+
     pub fn audio_clip_at_time(&self, time: f64) -> Option<PlayheadHit> {
-        for track in &self.audio_tracks {
-            for tc in &track.clips {
-                if time >= tc.timeline_start && time < tc.timeline_start + tc.duration {
-                    let source_time = tc.source_in + (time - tc.timeline_start);
-                    return Some(PlayheadHit {
-                        track_id: track.id,
-                        clip: tc.clone(),
-                        source_time,
-                    });
-                }
-            }
-        }
-        None
+        Self::clip_at_time_in(self.audio_tracks.iter(), time)
     }
 
     pub fn timeline_duration(&self) -> f64 {
@@ -311,6 +309,9 @@ impl Timeline {
         let mut moved = clip;
         moved.timeline_start = new_pos;
         track.clips.push(moved);
+        track
+            .clips
+            .sort_by(|a, b| a.timeline_start.total_cmp(&b.timeline_start));
     }
 
     pub fn move_clip_on_track(
@@ -357,6 +358,8 @@ impl Timeline {
         clip.timeline_start = new_pos;
         clip.track_id = dst_track_id;
         dst.clips.push(clip);
+        dst.clips
+            .sort_by(|a, b| a.timeline_start.total_cmp(&b.timeline_start));
     }
 
     pub fn move_clip_across_tracks(
@@ -414,6 +417,9 @@ impl Timeline {
             source_out: duration,
             linked_to: None,
         });
+        track
+            .clips
+            .sort_by(|a, b| a.timeline_start.total_cmp(&b.timeline_start));
         id
     }
 
@@ -426,7 +432,7 @@ impl Timeline {
         }
     }
 
-    pub fn sync_linked_clip(&mut self, clip_id: TimelineClipId) {
+    pub fn sync_linked_clip(&mut self, clip_id: TimelineClipId, resolve_overlaps: bool) {
         let Some((_, _, clip)) = self.find_clip(clip_id) else {
             return;
         };
@@ -438,58 +444,137 @@ impl Timeline {
         let src_in = clip.source_in;
         let src_out = clip.source_out;
 
-        if let Some((track, idx)) = self.find_clip_track_mut(linked_id) {
+        if resolve_overlaps {
+            let mut removed_clip = None;
+            let mut linked_track_id = None;
+            for track in self
+                .video_tracks
+                .iter_mut()
+                .chain(self.audio_tracks.iter_mut())
+            {
+                if let Some(idx) = track.clips.iter().position(|c| c.id == linked_id) {
+                    removed_clip = Some(track.clips.remove(idx));
+                    linked_track_id = Some(track.id);
+                    break;
+                }
+            }
+
+            let Some(mut lc) = removed_clip else {
+                return;
+            };
+            let Some(lt_id) = linked_track_id else {
+                return;
+            };
+
+            lc.timeline_start = start;
+            lc.duration = dur;
+            lc.source_in = src_in;
+            lc.source_out = src_out;
+
+            let Some(track) = self.track_by_id_mut(lt_id) else {
+                return;
+            };
+            track.resolve_overlaps(start, start + dur);
+            track.clips.push(lc);
+            track
+                .clips
+                .sort_by(|a, b| a.timeline_start.total_cmp(&b.timeline_start));
+        } else if let Some((track, idx)) = self.find_clip_track_mut(linked_id) {
             let lc = &mut track.clips[idx];
             lc.timeline_start = start;
             lc.duration = dur;
             lc.source_in = src_in;
             lc.source_out = src_out;
+            track
+                .clips
+                .sort_by(|a, b| a.timeline_start.total_cmp(&b.timeline_start));
         }
     }
 
-    pub fn sync_linked_clip_after_trim(&mut self, clip_id: TimelineClipId) {
-        let Some((_, _, clip)) = self.find_clip(clip_id) else {
-            return;
-        };
-        let Some(linked_id) = clip.linked_to else {
-            return;
-        };
-        let start = clip.timeline_start;
-        let dur = clip.duration;
-        let src_in = clip.source_in;
-        let src_out = clip.source_out;
+    pub fn finalize_trim(&mut self, clip_id: TimelineClipId) {
+        if let Some((track, clip_idx, _)) = self.find_clip(clip_id) {
+            let tc = &track.clips[clip_idx];
+            let start = tc.timeline_start;
+            let end = tc.timeline_start + tc.duration;
+            let track_id = track.id;
 
-        let mut removed_clip = None;
-        let mut linked_track_id = None;
-        for track in self
-            .video_tracks
-            .iter_mut()
-            .chain(self.audio_tracks.iter_mut())
-        {
-            if let Some(idx) = track.clips.iter().position(|c| c.id == linked_id) {
-                removed_clip = Some(track.clips.remove(idx));
-                linked_track_id = Some(track.id);
-                break;
+            let track = self.track_by_id_mut(track_id).expect("track exists");
+            let idx_to_skip = track
+                .clips
+                .iter()
+                .position(|c| c.id == clip_id)
+                .expect("clip exists");
+
+            let mut i = 0;
+            let mut splits: Vec<TimelineClip> = Vec::new();
+            while i < track.clips.len() {
+                if i == idx_to_skip {
+                    i += 1;
+                    continue;
+                }
+                let c = &track.clips[i];
+                let c_start = c.timeline_start;
+                let c_end = c.timeline_start + c.duration;
+
+                if c_end <= start || c_start >= end {
+                    i += 1;
+                    continue;
+                }
+
+                if c_start >= start && c_end <= end {
+                    track.clips.remove(i);
+                    if idx_to_skip > i {
+                        break;
+                    }
+                    continue;
+                }
+
+                if c_start < start && c_end > end {
+                    let left_duration = start - c_start;
+                    let right_duration = c_end - end;
+                    let right_in = c.source_in + (end - c_start);
+
+                    let right = TimelineClip {
+                        id: TimelineClipId::new(),
+                        source_id: c.source_id,
+                        track_id: c.track_id,
+                        timeline_start: end,
+                        duration: right_duration,
+                        source_in: right_in,
+                        source_out: c.source_out,
+                        linked_to: None,
+                    };
+                    splits.push(right);
+
+                    let c = &mut track.clips[i];
+                    c.duration = left_duration;
+                    c.source_out = c.source_in + left_duration;
+                    i += 1;
+                    continue;
+                }
+
+                if c_start < start {
+                    let c = &mut track.clips[i];
+                    let trimmed = c_end - start;
+                    c.duration -= trimmed;
+                    c.source_out -= trimmed;
+                    i += 1;
+                    continue;
+                }
+
+                let trim_amount = end - c_start;
+                let c = &mut track.clips[i];
+                c.source_in += trim_amount;
+                c.timeline_start = end;
+                c.duration -= trim_amount;
+                i += 1;
             }
+            track.clips.extend(splits);
+            track
+                .clips
+                .sort_by(|a, b| a.timeline_start.total_cmp(&b.timeline_start));
         }
-
-        let Some(mut lc) = removed_clip else {
-            return;
-        };
-        let Some(lt_id) = linked_track_id else {
-            return;
-        };
-
-        lc.timeline_start = start;
-        lc.duration = dur;
-        lc.source_in = src_in;
-        lc.source_out = src_out;
-
-        let Some(track) = self.track_by_id_mut(lt_id) else {
-            return;
-        };
-        track.resolve_overlaps(start, start + dur);
-        track.clips.push(lc);
+        self.sync_linked_clip(clip_id, true);
     }
 }
 

@@ -84,10 +84,6 @@ impl ProjectState {
         *entry ^= tag.bit();
     }
 
-    pub fn toggle_tag_filter(&mut self, ui: &mut UiState, tag: Tag) {
-        ui.tag_filter_mask ^= tag.bit();
-    }
-
     pub fn add_clip_to_track(
         &mut self,
         source_id: ClipId,
@@ -119,54 +115,75 @@ impl ProjectState {
     }
 }
 
-pub struct UiState {
+pub struct BrowserUiState {
     pub search_query: String,
     pub starred_only: bool,
     pub tag_filter_mask: u32,
-    pub selection: Selection,
-    pub hovered_scrub_t: Option<f32>,
-    pub hover_active_clip: Option<ClipId>,
-    pub hover_started_at: Option<f64>,
-    pub visible_clips: Vec<ClipId>,
-    pub show_fps: bool,
-    pub fps: f32,
-    pub timeline_scrubbing: Option<f64>,
-    pub show_browser: bool,
     pub sort_mode: SortMode,
     pub sort_ascending: bool,
     pub renaming_clip: Option<ClipId>,
     pub rename_buffer: String,
-    pub timeline_zoom: f32,
-    pub timeline_scroll_offset: f32,
-    pub timeline_dragging_clip: Option<TimelineClipId>,
-    pub trimming_clip: Option<TrimState>,
+    pub visible_clips: Vec<ClipId>,
+    pub hover_active_clip: Option<ClipId>,
+    pub hover_started_at: Option<f64>,
+    pub hovered_scrub_t: Option<f32>,
+    pub show_browser: bool,
 }
 
-impl Default for UiState {
+impl Default for BrowserUiState {
     fn default() -> Self {
         Self {
             search_query: String::new(),
             starred_only: false,
             tag_filter_mask: 0,
-            selection: Selection::default(),
-            hovered_scrub_t: None,
-            hover_active_clip: None,
-            hover_started_at: None,
-            visible_clips: Vec::new(),
-            show_fps: false,
-            fps: 0.0,
-            timeline_scrubbing: None,
-            show_browser: true,
             sort_mode: SortMode::ImportOrder,
             sort_ascending: true,
             renaming_clip: None,
             rename_buffer: String::new(),
-            timeline_zoom: 100.0,
-            timeline_scroll_offset: 0.0,
-            timeline_dragging_clip: None,
+            visible_clips: Vec::new(),
+            hover_active_clip: None,
+            hover_started_at: None,
+            hovered_scrub_t: None,
+            show_browser: true,
+        }
+    }
+}
+
+pub struct TimelineUiState {
+    pub zoom: f32,
+    pub scroll_offset: f32,
+    pub vertical_scroll_offset: f32,
+    pub scrubbing: Option<f64>,
+    pub dragging_clip: Option<TimelineClipId>,
+    pub trimming_clip: Option<TrimState>,
+}
+
+impl Default for TimelineUiState {
+    fn default() -> Self {
+        Self {
+            zoom: 100.0,
+            scroll_offset: 0.0,
+            vertical_scroll_offset: 0.0,
+            scrubbing: None,
+            dragging_clip: None,
             trimming_clip: None,
         }
     }
+}
+
+#[derive(Default)]
+pub struct DebugUiState {
+    pub show_fps: bool,
+    pub ui_fps: f32,
+    pub video_fps: f32,
+}
+
+#[derive(Default)]
+pub struct UiState {
+    pub browser: BrowserUiState,
+    pub timeline: TimelineUiState,
+    pub debug: DebugUiState,
+    pub selection: Selection,
 }
 
 #[derive(Default)]
@@ -177,19 +194,19 @@ pub struct AppState {
 
 impl AppState {
     pub fn filtered_clips(&self) -> Vec<ClipId> {
-        let query = self.ui.search_query.to_lowercase();
+        let query = self.ui.browser.search_query.to_lowercase();
         let tokens: Vec<&str> = query.split_whitespace().filter(|t| !t.is_empty()).collect();
         let mut result: Vec<ClipId> = self
             .project
             .clip_order
             .iter()
             .filter(|id| {
-                if self.ui.starred_only && !self.project.starred.contains(id) {
+                if self.ui.browser.starred_only && !self.project.starred.contains(id) {
                     return false;
                 }
-                if self.ui.tag_filter_mask != 0 {
+                if self.ui.browser.tag_filter_mask != 0 {
                     let clip_mask = self.project.clip_tags.get(*id).copied().unwrap_or(0);
-                    if (clip_mask & self.ui.tag_filter_mask) == 0 {
+                    if (clip_mask & self.ui.browser.tag_filter_mask) == 0 {
                         return false;
                     }
                 }
@@ -206,8 +223,8 @@ impl AppState {
             .collect();
 
         let clips = &self.project.clips;
-        let ascending = self.ui.sort_ascending;
-        match self.ui.sort_mode {
+        let ascending = self.ui.browser.sort_ascending;
+        match self.ui.browser.sort_mode {
             SortMode::ImportOrder => {
                 if !ascending {
                     result.reverse();

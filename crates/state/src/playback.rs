@@ -6,6 +6,12 @@ pub enum PlaybackState {
     PlayingReverse,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlaybackDirection {
+    Forward,
+    Reverse,
+}
+
 #[derive(Debug, Clone)]
 pub struct Playback {
     pub state: PlaybackState,
@@ -24,10 +30,18 @@ impl Default for Playback {
 }
 
 impl Playback {
+    pub fn direction(&self) -> PlaybackDirection {
+        match self.state {
+            PlaybackState::PlayingReverse => PlaybackDirection::Reverse,
+            PlaybackState::Playing | PlaybackState::Stopped => PlaybackDirection::Forward,
+        }
+    }
+
     pub fn toggle_play(&mut self) {
         self.state = match self.state {
             PlaybackState::Playing => PlaybackState::Stopped,
-            _ => PlaybackState::Playing,
+            PlaybackState::PlayingReverse => PlaybackState::Stopped,
+            PlaybackState::Stopped => PlaybackState::Playing,
         };
     }
 
