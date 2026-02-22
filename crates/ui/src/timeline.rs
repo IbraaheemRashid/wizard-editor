@@ -52,11 +52,6 @@ fn build_track_layout(state: &AppState) -> Vec<TrackLayout> {
 }
 
 pub fn timeline_panel(ui: &mut egui::Ui, state: &mut AppState, textures: &dyn TextureLookup) {
-    let screen_size = ui.ctx().screen_rect().size();
-    let gpu_waveforms_available = ui
-        .ctx()
-        .data(|d| d.get_temp::<bool>(egui::Id::new("gpu_waveforms")))
-        .unwrap_or(false);
     state.ui.timeline_scrubbing = None;
     ui.set_min_width(0.0);
     ui.set_min_height(0.0);
@@ -87,6 +82,13 @@ pub fn timeline_panel(ui: &mut egui::Ui, state: &mut AppState, textures: &dyn Te
     let track_layouts = build_track_layout(state);
 
     let mut pending_browser_drop: Option<(ClipId, TrackId, f64)> = None;
+
+    let total_height = track_layouts.len() as f32 * (TRACK_HEIGHT + 2.0);
+    let content_clip_rect = Rect::from_min_size(
+        pos2(content_left, tracks_top),
+        vec2(content_width, total_height),
+    );
+    let content_painter = ui.painter().with_clip_rect(content_clip_rect);
 
     for layout in &track_layouts {
         let track_id = layout.track_id;
@@ -185,8 +187,7 @@ pub fn timeline_panel(ui: &mut egui::Ui, state: &mut AppState, textures: &dyn Te
                 .timeline_dragging_clip
                 .is_some_and(|id| id == tc_id);
 
-            ui.painter()
-                .rect_filled(clip_rect, theme::ROUNDING_SM, clip_color);
+            content_painter.rect_filled(clip_rect, theme::ROUNDING_SM, clip_color);
 
             if layout.kind == TrackKind::Video {
                 let thumb_w = THUMB_WIDTH.min(clip_w);
@@ -194,7 +195,7 @@ pub fn timeline_panel(ui: &mut egui::Ui, state: &mut AppState, textures: &dyn Te
                     Rect::from_min_size(pos2(clip_x, y + 2.0), vec2(thumb_w, TRACK_HEIGHT - 4.0));
                 if let Some(tex) = textures.thumbnail(&tc_source_id) {
                     let uv = Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
-                    ui.painter().image(tex.id(), thumb_rect, uv, Color32::WHITE);
+                    content_painter.image(tex.id(), thumb_rect, uv, Color32::WHITE);
                 }
             } else if layout.kind == TrackKind::Audio {
                 if let Some(peaks) = textures.waveform_peaks(&tc_source_id) {
@@ -215,18 +216,7 @@ pub fn timeline_panel(ui: &mut egui::Ui, state: &mut AppState, textures: &dyn Te
                     } else {
                         peaks.as_slice()
                     };
-                    if gpu_waveforms_available && !visible_peaks.is_empty() {
-                        let wave_color = Color32::from_rgba_unmultiplied(180, 255, 200, 220);
-                        let cb = crate::waveform_gpu::waveform_paint_callback(
-                            clip_rect,
-                            visible_peaks,
-                            wave_color,
-                            [screen_size.x, screen_size.y],
-                        );
-                        ui.painter().add(cb);
-                    } else {
-                        draw_waveform(ui, clip_rect, visible_peaks, clip_color);
-                    }
+                    draw_waveform(&content_painter, clip_rect, visible_peaks, clip_color);
                 }
             }
 
@@ -238,16 +228,16 @@ pub fn timeline_panel(ui: &mut egui::Ui, state: &mut AppState, textures: &dyn Te
                     name.to_string()
                 };
                 let label_rect = Rect::from_min_size(
-                    pos2(clip_rect.min.x, clip_rect.max.y - 16.0),
-                    vec2(clip_w.min(clip_rect.width()), 16.0),
+                    pos2(clip_rect.min.x, clip_rect.max.y - 14.0),
+                    vec2(clip_w.min(clip_rect.width()), 14.0),
                 );
-                ui.painter().rect_filled(
+                content_painter.rect_filled(
                     label_rect,
                     CornerRadius::ZERO,
                     Color32::from_black_alpha(160),
                 );
-                ui.painter().text(
-                    pos2(clip_rect.min.x + 4.0, clip_rect.max.y - 8.0),
+                content_painter.text(
+                    pos2(clip_rect.min.x + 4.0, clip_rect.max.y - 7.0),
                     egui::Align2::LEFT_CENTER,
                     label,
                     egui::FontId::proportional(10.0),
@@ -256,7 +246,7 @@ pub fn timeline_panel(ui: &mut egui::Ui, state: &mut AppState, textures: &dyn Te
             }
 
             if state.project.starred.contains(&tc_source_id) {
-                ui.painter().text(
+                content_painter.text(
                     clip_rect.right_top() + vec2(-12.0, 2.0),
                     egui::Align2::CENTER_TOP,
                     "\u{2605}",
@@ -266,7 +256,7 @@ pub fn timeline_panel(ui: &mut egui::Ui, state: &mut AppState, textures: &dyn Te
             }
 
             if is_selected {
-                ui.painter().rect_stroke(
+                content_painter.rect_stroke(
                     clip_rect,
                     theme::ROUNDING_SM,
                     Stroke::new(2.0, theme::ACCENT),
@@ -275,7 +265,7 @@ pub fn timeline_panel(ui: &mut egui::Ui, state: &mut AppState, textures: &dyn Te
             }
 
             if is_being_dragged {
-                ui.painter().rect_filled(
+                content_painter.rect_filled(
                     clip_rect,
                     theme::ROUNDING_SM,
                     Color32::from_white_alpha(30),
@@ -636,6 +626,14 @@ fn handle_clip_drag_drop(
         return;
     }
     let dst_track_id = track_layouts[dst_display_idx].track_id;
+    let dst_kind = track_layouts[dst_display_idx].kind;
+
+    let src_kind = state.project.timeline.track_kind_for_clip(src_clip_id);
+    if let Some(sk) = src_kind {
+        if sk != dst_kind {
+            return;
+        }
+    }
 
     let new_pos = ((pointer.x - content_left + scroll) / pps).max(0.0) as f64;
 
@@ -653,15 +651,15 @@ fn handle_clip_drag_drop(
     state.ui.selection.selected_timeline_clip = None;
 }
 
-fn draw_waveform(ui: &mut egui::Ui, rect: Rect, peaks: &[(f32, f32)], _base_color: Color32) {
+fn draw_waveform(painter: &egui::Painter, rect: Rect, peaks: &[(f32, f32)], _base_color: Color32) {
     if peaks.is_empty() {
         return;
     }
 
-    let wave_color = Color32::from_rgba_unmultiplied(180, 255, 200, 220);
+    let wave_color = Color32::from_rgba_unmultiplied(180, 255, 200, 240);
 
     let center_y = rect.center().y;
-    let half_h = rect.height() * 0.4;
+    let half_h = rect.height() * 0.45;
     let num_bars = (rect.width() as usize).min(peaks.len()).max(1);
     let bar_width = rect.width() / num_bars as f32;
     let min_bar_half = 1.0_f32;
@@ -679,8 +677,7 @@ fn draw_waveform(ui: &mut egui::Ui, rect: Rect, peaks: &[(f32, f32)], _base_colo
         let x = rect.min.x + i as f32 * bar_width;
 
         let bar_rect = Rect::from_min_max(pos2(x, top), pos2(x + bar_width.max(1.0), bottom));
-        ui.painter()
-            .rect_filled(bar_rect, CornerRadius::ZERO, wave_color);
+        painter.rect_filled(bar_rect, CornerRadius::ZERO, wave_color);
     }
 }
 
@@ -874,9 +871,15 @@ fn draw_drag_ghosts(
                 let clip_id = tc.source_id;
                 let duration = tc.duration;
                 let linked_id = tc.linked_to;
-                let clip_color = match target_kind {
-                    TrackKind::Video => theme::CLIP_VIDEO,
-                    TrackKind::Audio => theme::CLIP_AUDIO,
+                let src_kind = state.project.timeline.track_kind_for_clip(src_clip_id);
+                let kind_mismatch = src_kind.is_some_and(|sk| sk != target_kind);
+                let clip_color = if kind_mismatch {
+                    Color32::from_rgba_unmultiplied(255, 80, 80, 120)
+                } else {
+                    match target_kind {
+                        TrackKind::Video => theme::CLIP_VIDEO,
+                        TrackKind::Audio => theme::CLIP_AUDIO,
+                    }
                 };
                 let track_y = tracks_top + target_display_idx as f32 * (TRACK_HEIGHT + 2.0);
                 draw_clip_ghost(

@@ -191,6 +191,10 @@ impl Timeline {
         None
     }
 
+    pub fn track_kind_for_clip(&self, id: TimelineClipId) -> Option<TrackKind> {
+        self.find_clip(id).map(|(track, _, _)| track.kind)
+    }
+
     pub fn find_clip(&self, id: TimelineClipId) -> Option<(&Track, usize, &TimelineClip)> {
         for track in self.all_tracks() {
             for (i, clip) in track.clips.iter().enumerate() {

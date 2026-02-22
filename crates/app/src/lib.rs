@@ -842,7 +842,7 @@ impl eframe::App for EditorApp {
             });
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            wizard_ui::preview::preview_panel(ui, &self.state, &self.textures);
+            wizard_ui::preview::preview_panel(ui, &mut self.state, &self.textures);
         });
 
         if self.state.ui.show_fps {
