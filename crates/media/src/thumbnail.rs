@@ -74,8 +74,7 @@ pub fn extract_preview_frames_streaming(
             break;
         }
 
-        let Some((img, pts)) =
-            decoder.decode_next_frame_with_pts(PREVIEW_WIDTH, PREVIEW_HEIGHT)
+        let Some((img, pts)) = decoder.decode_next_frame_with_pts(PREVIEW_WIDTH, PREVIEW_HEIGHT)
         else {
             break;
         };

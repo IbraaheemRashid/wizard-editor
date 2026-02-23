@@ -85,6 +85,12 @@ impl AudioOutput {
         producer
     }
 
+    pub fn clear_buffer(&self) {
+        if let Ok(mut slot) = self.consumer_slot.lock() {
+            while slot.try_pop().is_some() {}
+        }
+    }
+
     pub fn swap_consumer(&self, consumer: AudioConsumer) {
         if let Ok(mut slot) = self.consumer_slot.lock() {
             *slot = consumer;

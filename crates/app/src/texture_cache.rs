@@ -12,6 +12,27 @@ pub struct TextureCache {
     pub playback_texture: Option<egui::TextureHandle>,
 }
 
+impl TextureCache {
+    pub fn update_playback_texture(
+        &mut self,
+        ctx: &egui::Context,
+        width: usize,
+        height: usize,
+        rgba_data: &[u8],
+    ) {
+        let image = egui::ColorImage::from_rgba_unmultiplied([width, height], rgba_data);
+        if let Some(ref mut handle) = self.playback_texture {
+            let [tw, th] = handle.size();
+            if tw == width && th == height {
+                handle.set(image, egui::TextureOptions::LINEAR);
+                return;
+            }
+        }
+        let texture = ctx.load_texture("playback_frame", image, egui::TextureOptions::LINEAR);
+        self.playback_texture = Some(texture);
+    }
+}
+
 impl wizard_ui::TextureLookup for TextureCache {
     fn thumbnail(&self, id: &ClipId) -> Option<&egui::TextureHandle> {
         self.thumbnails.get(id)

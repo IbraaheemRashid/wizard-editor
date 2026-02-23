@@ -639,6 +639,32 @@ impl Timeline {
     }
 }
 
+impl Timeline {
+    pub fn remove_clip(&mut self, clip_id: TimelineClipId) {
+        let linked = self.find_clip(clip_id).and_then(|(_, _, c)| c.linked_to);
+        for track in self.all_tracks_mut() {
+            track.clips.retain(|c| c.id != clip_id);
+        }
+        if let Some(linked_id) = linked {
+            for track in self.all_tracks_mut() {
+                track.clips.retain(|c| c.id != linked_id);
+            }
+        }
+    }
+
+    pub fn remove_clip_single(&mut self, clip_id: TimelineClipId) {
+        let linked = self.find_clip(clip_id).and_then(|(_, _, c)| c.linked_to);
+        for track in self.all_tracks_mut() {
+            track.clips.retain(|c| c.id != clip_id);
+        }
+        if let Some(linked_id) = linked {
+            if let Some((track, idx)) = self.find_clip_track_mut(linked_id) {
+                track.clips[idx].linked_to = None;
+            }
+        }
+    }
+}
+
 impl Default for Timeline {
     fn default() -> Self {
         Self::new()

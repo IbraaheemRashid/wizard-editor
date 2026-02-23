@@ -8,12 +8,9 @@ pub mod texture_cache;
 pub mod workers;
 
 use std::collections::HashSet;
-use std::fs::OpenOptions;
-use std::io::Write;
 use std::path::PathBuf;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use notify::RecommendedWatcher;
 use wizard_audio::output::{AudioOutput, AudioProducer};
@@ -30,32 +27,6 @@ use workers::preview_worker::PreviewWorkerChannels;
 use workers::video_decode_worker::VideoDecodeWorkerChannels;
 
 use crate::constants::*;
-
-pub(crate) fn agent_debug_log(
-    location: &str,
-    message: &str,
-    run_id: &str,
-    hypothesis_id: &str,
-    data_json: &str,
-) {
-    const DEBUG_LOG_PATH: &str = "/Users/irashid/personal/wizard-editor/.cursor/debug.log";
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
-    let id = format!("log_{}_{}", timestamp, hypothesis_id);
-    let line = format!(
-        "{{\"id\":\"{}\",\"timestamp\":{},\"location\":\"{}\",\"message\":\"{}\",\"data\":{},\"runId\":\"{}\",\"hypothesisId\":\"{}\"}}\n",
-        id, timestamp, location, message, data_json, run_id, hypothesis_id
-    );
-    if let Ok(mut file) = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(DEBUG_LOG_PATH)
-    {
-        let _ = file.write_all(line.as_bytes());
-    }
-}
 
 pub struct EditorApp {
     state: AppState,
@@ -197,10 +168,6 @@ impl eframe::App for EditorApp {
             let pipeline_delivering = (self.forward.is_some() || self.reverse.is_some())
                 && fwd_frame_delivered
                 && recent_pipeline_frame;
-            let forward_startup_hold = self.state.project.playback.state == PlaybackState::Playing
-                && self.forward.is_some()
-                && !fwd_frame_delivered
-                && fwd_started_at.is_some_and(|t| (now - t) <= FORWARD_STARTUP_GRACE_S);
             let reverse_startup_hold = self.state.project.playback.state
                 == PlaybackState::PlayingReverse
                 && self.reverse.is_some()
@@ -209,13 +176,20 @@ impl eframe::App for EditorApp {
             let is_playing_forward = self.state.project.playback.state == PlaybackState::Playing;
             let is_playing_reverse =
                 self.state.project.playback.state == PlaybackState::PlayingReverse;
-            let should_use_clock_advance = (!pipeline_delivering || is_playing_forward
-                || is_playing_reverse)
-                && !forward_startup_hold
-                && !reverse_startup_hold
-                && self.state.project.playback.state != PlaybackState::Stopped;
+            let should_use_clock_advance =
+                (!pipeline_delivering || is_playing_forward || is_playing_reverse)
+                    && !reverse_startup_hold
+                    && self.state.project.playback.state != PlaybackState::Stopped;
             if should_use_clock_advance {
                 self.state.project.playback.advance(dt, duration);
+            }
+            if DEBUG_PLAYBACK
+                && is_playing_forward
+                && !fwd_frame_delivered
+                && self.forward.is_some()
+            {
+                let elapsed_ms = fwd_started_at.map(|t| (now - t) * 1000.0).unwrap_or(0.0);
+                eprintln!("[DBG] clock advancing before first frame, elapsed={elapsed_ms:.1}ms");
             }
             if dt > 0.0 {
                 let inst_fps = (1.0 / dt) as f32;

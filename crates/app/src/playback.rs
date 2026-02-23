@@ -1,11 +1,11 @@
-use std::sync::{Arc, Mutex};
-
 use wizard_state::playback::PlaybackState;
 
 use crate::constants::*;
 use crate::workers::audio_worker::AudioPreviewRequest;
 use crate::workers::preview_worker::PreviewRequest;
-use crate::workers::video_decode_worker::VideoDecodeRequest;
+use crate::workers::video_decode_worker::{
+    VideoDecodeRequest, PLAYBACK_DECODE_HEIGHT, PLAYBACK_DECODE_WIDTH,
+};
 use crate::EditorApp;
 
 impl EditorApp {
@@ -23,12 +23,10 @@ impl EditorApp {
             .unwrap_or(false)
     }
 
-    pub fn reset_audio_queue(&mut self) {
+    pub fn reset_audio_sources(&mut self) {
         self.mixer.clear();
         if let Some(ref output) = self.audio_output {
-            let producer = output.swap_buffer();
-            self.audio_producer = Arc::new(Mutex::new(producer));
-            self.mixer.output = self.audio_producer.clone();
+            output.clear_buffer();
         }
     }
 
@@ -39,7 +37,7 @@ impl EditorApp {
         self.last_video_decode_request = None;
         self.last_decoded_frame = None;
         self.shadow = None;
-        self.reset_audio_queue();
+        self.reset_audio_sources();
     }
 
     pub fn handle_playback_state_transition(
@@ -262,10 +260,22 @@ impl EditorApp {
                     return;
                 }
 
+                let (tw, th) = if is_scrubbing {
+                    (SCRUB_DECODE_WIDTH, SCRUB_DECODE_HEIGHT)
+                } else {
+                    (PLAYBACK_DECODE_WIDTH, PLAYBACK_DECODE_HEIGHT)
+                };
                 let _ = self.video_decode.req_tx.send(VideoDecodeRequest {
                     clip_id: hit.clip.source_id,
                     path: clip.path.clone(),
                     time_seconds: hit.source_time,
+                    target_width: tw,
+                    target_height: th,
+                    max_decode_frames: if is_scrubbing {
+                        SCRUB_MAX_DECODE_FRAMES
+                    } else {
+                        PLAYBACK_MAX_DECODE_FRAMES
+                    },
                 });
                 self.last_video_decode_request = Some((hit.clip.source_id, bucket));
             }

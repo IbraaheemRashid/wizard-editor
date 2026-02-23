@@ -85,36 +85,34 @@ pub fn spawn_preview_worker() -> PreviewWorkerChannels {
     for _ in 0..WORKER_COUNT {
         let work_rx = Arc::clone(&work_rx);
         let result_tx = result_tx.clone();
-        std::thread::spawn(move || {
-            loop {
-                let (clip_id, path) = {
-                    let rx = work_rx.lock().expect("work_rx lock poisoned");
-                    match rx.recv() {
-                        Ok(item) => item,
-                        Err(_) => return,
-                    }
-                };
+        std::thread::spawn(move || loop {
+            let (clip_id, path) = {
+                let rx = work_rx.lock().expect("work_rx lock poisoned");
+                match rx.recv() {
+                    Ok(item) => item,
+                    Err(_) => return,
+                }
+            };
 
-                let (frame_tx, frame_rx) = mpsc::channel();
-                wizard_media::thumbnail::extract_preview_frames_streaming(
-                    &path,
-                    PREVIEW_FRAME_COUNT,
-                    &frame_tx,
-                );
-                drop(frame_tx);
+            let (frame_tx, frame_rx) = mpsc::channel();
+            wizard_media::thumbnail::extract_preview_frames_streaming(
+                &path,
+                PREVIEW_FRAME_COUNT,
+                &frame_tx,
+            );
+            drop(frame_tx);
 
-                while let Ok((index, image)) = frame_rx.recv() {
-                    if result_tx
-                        .send(PreviewFrame {
-                            clip_id,
-                            index,
-                            total: PREVIEW_FRAME_COUNT,
-                            image,
-                        })
-                        .is_err()
-                    {
-                        return;
-                    }
+            while let Ok((index, image)) = frame_rx.recv() {
+                if result_tx
+                    .send(PreviewFrame {
+                        clip_id,
+                        index,
+                        total: PREVIEW_FRAME_COUNT,
+                        image,
+                    })
+                    .is_err()
+                {
+                    return;
                 }
             }
         });

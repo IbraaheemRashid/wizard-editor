@@ -33,5 +33,17 @@ pub fn handle_keyboard(ctx: &egui::Context, state: &mut AppState) {
             state.project.playback.speed = 1.0;
             state.project.playback.toggle_play();
         }
+        if i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace) {
+            if let Some(clip_id) = state.ui.selection.selected_timeline_clip.take() {
+                state.project.snapshot_for_undo();
+                state.project.timeline.remove_clip(clip_id);
+            }
+        }
+        if i.modifiers.command && !i.modifiers.shift && i.key_pressed(egui::Key::Z) {
+            state.project.undo();
+        }
+        if i.modifiers.command && i.modifiers.shift && i.key_pressed(egui::Key::Z) {
+            state.project.redo();
+        }
     });
 }

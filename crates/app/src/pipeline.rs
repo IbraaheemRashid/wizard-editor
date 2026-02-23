@@ -11,30 +11,8 @@ use wizard_state::timeline::TimelineClipId;
 use crate::audio_mixer::AudioMixer;
 use crate::constants::*;
 use crate::workers;
+use crate::workers::video_decode_worker::VideoDecodeRequest;
 use crate::EditorApp;
-
-fn append_debug_log(location: &str, message: &str, hypothesis_id: &str, data_json: String) {
-    use std::fs::OpenOptions;
-    use std::io::Write;
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
-    let id = format!("log_{timestamp}_{hypothesis_id}");
-    if let Ok(mut file) = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("/Users/irashid/personal/wizard-editor/.cursor/debug.log")
-    {
-        let _ = writeln!(
-            file,
-            "{{\"id\":\"{}\",\"timestamp\":{},\"location\":\"{}\",\"message\":\"{}\",\"data\":{},\"runId\":\"audio-resampler-debug\",\"hypothesisId\":\"{}\"}}",
-            id, timestamp, location, message, data_json, hypothesis_id
-        );
-    }
-}
 
 pub struct ForwardPipelineState {
     pub handle: PipelineHandle,
@@ -45,12 +23,17 @@ pub struct ForwardPipelineState {
     pub frame_delivered: bool,
     pub started_at: f64,
     pub last_frame_time: Option<f64>,
+    pub age: u32,
 }
 
 pub struct ShadowPipelineState {
     pub handle: PipelineHandle,
     pub clip: (ClipId, PathBuf),
     pub timeline_clip: TimelineClipId,
+    pub started_at: f64,
+    pub first_frame_ready: bool,
+    pub buffered_frame: Option<DecodedFrame>,
+    pub audio_sources: Vec<(AudioOnlyHandle, wizard_audio::output::AudioConsumer)>,
 }
 
 pub struct ReversePipelineState {
@@ -64,7 +47,19 @@ pub struct ReversePipelineState {
 }
 
 impl EditorApp {
-    pub fn manage_shadow_pipeline(&mut self, _now: f64) {
+    pub fn poll_shadow_frame(&mut self) {
+        if let Some(ref mut shadow) = self.shadow {
+            if shadow.first_frame_ready {
+                return;
+            }
+            if let Some(frame) = shadow.handle.try_recv_frame() {
+                shadow.first_frame_ready = true;
+                shadow.buffered_frame = Some(frame);
+            }
+        }
+    }
+
+    pub fn manage_shadow_pipeline(&mut self, now: f64) {
         if self.state.project.playback.state != PlaybackState::Playing {
             return;
         }
@@ -130,10 +125,45 @@ impl EditorApp {
             speed,
         ) {
             Ok(handle) => {
+                let next_time = self
+                    .state
+                    .project
+                    .timeline
+                    .find_clip(current_timeline_clip)
+                    .map(|(_, _, tc)| tc.timeline_start + tc.duration)
+                    .unwrap_or(self.state.project.playback.playhead);
+
+                let mut audio_sources = Vec::new();
+                let audio_hits = self.state.project.timeline.audio_clips_at_time(next_time);
+                for hit in audio_hits {
+                    let Some(aclip) = self.state.project.clips.get(&hit.clip.source_id) else {
+                        continue;
+                    };
+                    if self.path_has_no_audio(&aclip.path) {
+                        continue;
+                    }
+                    let (producer, consumer) = AudioMixer::create_source_producer();
+                    let source_producer = Arc::new(Mutex::new(producer));
+                    if let Ok(audio_handle) = AudioOnlyHandle::start(
+                        &aclip.path,
+                        hit.source_time,
+                        source_producer,
+                        self.audio_sample_rate,
+                        self.audio_channels,
+                        speed,
+                    ) {
+                        audio_sources.push((audio_handle, consumer));
+                    }
+                }
+
                 self.shadow = Some(ShadowPipelineState {
                     handle,
                     clip: (next_clip_id, path),
                     timeline_clip: next_timeline_clip_id,
+                    started_at: now,
+                    first_frame_ready: false,
+                    buffered_frame: None,
+                    audio_sources,
                 });
             }
             Err(e) => {
@@ -161,9 +191,6 @@ impl EditorApp {
         }
 
         let shadow = self.shadow.take().expect("shadow checked above");
-        shadow.handle.reset_clock();
-
-        self.reset_audio_queue();
 
         let mut fwd = ForwardPipelineState {
             handle: shadow.handle,
@@ -174,27 +201,44 @@ impl EditorApp {
             frame_delivered: false,
             started_at: now,
             last_frame_time: None,
+            age: 0,
         };
 
         self.state.project.playback.playhead = next_time;
 
-        while let Some(frame) = fwd.handle.try_recv_frame() {
-            let texture = ctx.load_texture(
-                "playback_frame",
-                egui::ColorImage::from_rgba_unmultiplied(
-                    [frame.width as usize, frame.height as usize],
-                    &frame.rgba_data,
-                ),
-                egui::TextureOptions::LINEAR,
+        if let Some(frame) = shadow.buffered_frame {
+            self.textures.update_playback_texture(
+                ctx,
+                frame.width as usize,
+                frame.height as usize,
+                &frame.rgba_data,
             );
-            self.textures.playback_texture = Some(texture);
             self.last_decoded_frame = Some((frame.pts_seconds, "fwd"));
             fwd.frame_delivered = true;
             fwd.last_frame_time = Some(now);
+        } else {
+            let _ = self.video_decode.req_tx.send(VideoDecodeRequest {
+                clip_id: next_hit.clip.source_id,
+                path: fwd.clip.1.clone(),
+                time_seconds: next_hit.source_time,
+                target_width: workers::video_decode_worker::PLAYBACK_DECODE_WIDTH,
+                target_height: workers::video_decode_worker::PLAYBACK_DECODE_HEIGHT,
+                max_decode_frames: SCRUB_MAX_DECODE_FRAMES,
+            });
+            self.last_video_decode_request = None;
         }
 
         self.forward = Some(fwd);
-        self.start_audio_sources();
+
+        if !shadow.audio_sources.is_empty() {
+            self.mixer.replace_sources(shadow.audio_sources);
+            if let Some(ref output) = self.audio_output {
+                output.clear_buffer();
+            }
+        } else {
+            self.reset_audio_sources();
+            self.start_audio_sources();
+        }
 
         true
     }
@@ -234,7 +278,7 @@ impl EditorApp {
             self.textures.playback_texture = None;
             self.last_decoded_frame = None;
             if had_pipeline {
-                self.reset_audio_queue();
+                self.reset_audio_sources();
             }
             if is_forward && !is_scrubbing {
                 let has_audio = self
@@ -246,7 +290,7 @@ impl EditorApp {
                     self.start_audio_sources();
                 } else if !has_audio && self.mixer.source_count() > 0 {
                     self.mixer.clear();
-                    self.reset_audio_queue();
+                    self.reset_audio_sources();
                 }
             }
             self.was_scrubbing = is_scrubbing;
@@ -267,12 +311,16 @@ impl EditorApp {
             self.forward = None;
             self.reverse = None;
             self.shadow = None;
-            self.reset_audio_queue();
+            self.reset_audio_sources();
             self.was_scrubbing = true;
             return;
         }
 
         if is_forward {
+            if let Some(ref mut fwd) = self.forward {
+                fwd.age = fwd.age.saturating_add(1);
+            }
+
             let speed = self.state.project.playback.speed;
             let fwd_speed = self.forward.as_ref().map(|f| f.speed).unwrap_or(speed);
             let speed_changed = self.forward.is_some() && (speed - fwd_speed).abs() > 0.01;
@@ -280,21 +328,16 @@ impl EditorApp {
             let needs_new_pipeline = match self.forward.as_ref() {
                 None => true,
                 Some(fwd) => {
-                    fwd.timeline_clip != timeline_clip_id
-                        || fwd.clip.0 != clip_id
-                        || fwd.clip.1 != path
+                    fwd.age >= 2
+                        && (fwd.timeline_clip != timeline_clip_id
+                            || fwd.clip.0 != clip_id
+                            || fwd.clip.1 != path)
                 }
             };
 
             if speed_changed && !needs_new_pipeline {
-                if let Some(ref fwd) = self.forward {
-                    fwd.handle.update_speed(speed);
-                }
-                self.forward = None;
-                self.shadow = None;
-                self.reset_audio_queue();
-                self.start_pipeline(timeline_clip_id, clip_id, &path, hit.source_time, now);
                 if let Some(ref mut fwd) = self.forward {
+                    fwd.handle.update_speed(speed);
                     fwd.speed = speed;
                 }
             }
@@ -305,17 +348,23 @@ impl EditorApp {
             if self.forward.is_some() && has_stale_pipeline && !needs_new_pipeline {
                 self.forward = None;
                 self.shadow = None;
-                self.reset_audio_queue();
+                self.reset_audio_sources();
                 self.start_pipeline(timeline_clip_id, clip_id, &path, hit.source_time, now);
                 self.was_scrubbing = is_scrubbing;
                 return;
             }
 
             if scrub_just_released || needs_new_pipeline {
+                if DEBUG_PLAYBACK {
+                    eprintln!("[DBG] needs_new_pipeline={needs_new_pipeline} scrub_just_released={scrub_just_released} forward.is_some()={}", self.forward.is_some());
+                    if let Some(ref fwd) = self.forward {
+                        eprintln!("[DBG]   fwd.timeline_clip={:?} vs {:?}, fwd.clip.0={:?} vs {:?}, path_match={}", fwd.timeline_clip, timeline_clip_id, fwd.clip.0, clip_id, fwd.clip.1 == path);
+                    }
+                }
                 self.forward = None;
                 self.shadow = None;
                 if scrub_just_released {
-                    self.reset_audio_queue();
+                    self.reset_audio_sources();
                 }
                 self.start_pipeline(timeline_clip_id, clip_id, &path, hit.source_time, now);
                 if scrub_just_released {
@@ -354,35 +403,6 @@ impl EditorApp {
         };
 
         if needs_new {
-            let (has_existing_reverse, timeline_mismatch, clip_id_mismatch, path_mismatch) =
-                if let Some(ref rev) = self.reverse {
-                    (
-                        true,
-                        rev.timeline_clip != timeline_clip_id,
-                        rev.clip.0 != clip_id,
-                        rev.clip.1 != *path,
-                    )
-                } else {
-                    (false, false, false, false)
-                };
-            // #region agent log
-            crate::agent_debug_log(
-                "crates/app/src/pipeline.rs:manage_reverse_pipeline",
-                "Reverse pipeline started/restarted",
-                "pre-fix",
-                "H7",
-                &format!(
-                    "{{\"hasExistingReverse\":{},\"timelineMismatch\":{},\"clipIdMismatch\":{},\"pathMismatch\":{},\"sourceTime\":{:.6},\"playhead\":{:.6},\"speed\":{:.3}}}",
-                    has_existing_reverse,
-                    timeline_mismatch,
-                    clip_id_mismatch,
-                    path_mismatch,
-                    source_time,
-                    self.state.project.playback.playhead,
-                    speed
-                ),
-            );
-            // #endregion
             self.reverse = None;
             match ReversePipelineHandle::start(
                 path,
@@ -417,7 +437,10 @@ impl EditorApp {
         source_time: f64,
         now: f64,
     ) {
-        self.reset_audio_queue();
+        if DEBUG_PLAYBACK {
+            eprintln!("[DBG] start_pipeline called, source_time={source_time:.3}s");
+        }
+        self.reset_audio_sources();
 
         let speed = self.state.project.playback.speed;
 
@@ -441,7 +464,17 @@ impl EditorApp {
                     frame_delivered: false,
                     started_at: now,
                     last_frame_time: None,
+                    age: 0,
                 });
+                let _ = self.video_decode.req_tx.send(VideoDecodeRequest {
+                    clip_id,
+                    path: path.to_path_buf(),
+                    time_seconds: source_time,
+                    target_width: workers::video_decode_worker::PLAYBACK_DECODE_WIDTH,
+                    target_height: workers::video_decode_worker::PLAYBACK_DECODE_HEIGHT,
+                    max_decode_frames: SCRUB_MAX_DECODE_FRAMES,
+                });
+                self.last_video_decode_request = None;
             }
             Err(e) => {
                 eprintln!("Failed to start pipeline: {e}");
@@ -449,27 +482,17 @@ impl EditorApp {
         }
 
         self.start_audio_sources();
+
+        if let Some((_, _, tc)) = self.state.project.timeline.find_clip(timeline_clip_id) {
+            let remaining = (tc.timeline_start + tc.duration)
+                - self.state.project.playback.playhead;
+            if remaining < SHADOW_LOOKAHEAD_S / self.state.project.playback.speed {
+                self.manage_shadow_pipeline(now);
+            }
+        }
     }
 
     pub fn start_audio_sources(&mut self) {
-        // #region agent log
-        append_debug_log(
-            "crates/app/src/pipeline.rs:start_audio_sources",
-            "start_audio_sources invoked",
-            "H10",
-            format!(
-                "{{\"playhead\":{},\"speed\":{},\"existingSources\":{},\"audioHits\":{}}}",
-                self.state.project.playback.playhead,
-                self.state.project.playback.speed,
-                self.mixer.source_count(),
-                self.state
-                    .project
-                    .timeline
-                    .audio_clips_at_time(self.state.project.playback.playhead)
-                    .len()
-            ),
-        );
-        // #endregion
         self.mixer.clear();
 
         let playhead = self.state.project.playback.playhead;
@@ -513,15 +536,12 @@ impl EditorApp {
         now: f64,
     ) -> bool {
         self.last_decoded_frame = Some((frame.pts_seconds, "fwd"));
-        let texture = ctx.load_texture(
-            "playback_frame",
-            egui::ColorImage::from_rgba_unmultiplied(
-                [frame.width as usize, frame.height as usize],
-                &frame.rgba_data,
-            ),
-            egui::TextureOptions::LINEAR,
+        self.textures.update_playback_texture(
+            ctx,
+            frame.width as usize,
+            frame.height as usize,
+            &frame.rgba_data,
         );
-        self.textures.playback_texture = Some(texture);
 
         let active_clip = self.forward.as_ref().and_then(|fwd| {
             self.state
@@ -543,7 +563,7 @@ impl EditorApp {
             };
             let mapped_source_pts = frame.pts_seconds - pts_offset;
 
-            if mapped_source_pts >= source_out {
+            if mapped_source_pts >= source_out && fwd.age >= 2 {
                 let next_time = timeline_start + duration;
                 self.state.project.playback.playhead = next_time;
                 self.forward = None;
@@ -567,7 +587,7 @@ impl EditorApp {
                         );
                     }
                 } else {
-                    self.reset_audio_queue();
+                    self.reset_audio_sources();
                 }
                 return false;
             }
@@ -600,44 +620,18 @@ impl EditorApp {
         frame: &DecodedFrame,
         now: f64,
     ) -> bool {
-        let playhead_before = self.state.project.playback.playhead;
         let previous_rev_pts = self
             .last_decoded_frame
             .and_then(|(pts, source)| (source == "rev").then_some(pts));
         self.last_decoded_frame = Some((frame.pts_seconds, "rev"));
-        let texture = ctx.load_texture(
-            "playback_frame",
-            egui::ColorImage::from_rgba_unmultiplied(
-                [frame.width as usize, frame.height as usize],
-                &frame.rgba_data,
-            ),
-            egui::TextureOptions::LINEAR,
+        self.textures.update_playback_texture(
+            ctx,
+            frame.width as usize,
+            frame.height as usize,
+            &frame.rgba_data,
         );
-        self.textures.playback_texture = Some(texture);
 
         if let Some(ref mut rev) = self.reverse {
-            let frame_gap = rev.last_frame_time.map(|t| now - t);
-            if frame_gap.is_some_and(|gap| gap > 0.2) {
-                // #region agent log
-                crate::agent_debug_log(
-                    "crates/app/src/pipeline.rs:apply_reverse_pipeline_frame",
-                    "Large reverse frame gap detected",
-                    "pre-fix",
-                    "H6",
-                    &format!(
-                        "{{\"frameGap\":{},\"playheadBefore\":{:.6},\"framePts\":{:.6},\"prevRevPts\":{}}}",
-                        frame_gap
-                            .map(|v| format!("{:.6}", v))
-                            .unwrap_or_else(|| "null".to_string()),
-                        playhead_before,
-                        frame.pts_seconds,
-                        previous_rev_pts
-                            .map(|v| format!("{:.6}", v))
-                            .unwrap_or_else(|| "null".to_string())
-                    ),
-                );
-                // #endregion
-            }
             rev.last_frame_time = Some(now);
             if let Some((_, _, tc)) = self.state.project.timeline.find_clip(rev.timeline_clip) {
                 let expected_source_at_playhead = tc.source_in
@@ -647,101 +641,22 @@ impl EditorApp {
                 } else {
                     let offset = frame.pts_seconds - expected_source_at_playhead;
                     rev.pts_offset = Some(offset);
-                    // #region agent log
-                    crate::agent_debug_log(
-                        "crates/app/src/pipeline.rs:apply_reverse_pipeline_frame",
-                        "Initialized reverse pts offset",
-                        "pre-fix",
-                        "H3",
-                        &format!(
-                            "{{\"framePts\":{:.6},\"expectedSourceAtPlayhead\":{:.6},\"computedOffset\":{:.6},\"playhead\":{:.6}}}",
-                            frame.pts_seconds,
-                            expected_source_at_playhead,
-                            offset,
-                            playhead_before
-                        ),
-                    );
-                    // #endregion
                     offset
                 };
                 let mapped_source_pts = frame.pts_seconds - pts_offset;
 
                 if mapped_source_pts >= tc.source_in && mapped_source_pts < tc.source_out {
                     let timeline_pos = tc.timeline_start + (mapped_source_pts - tc.source_in);
-                    // Mirror forward monotonicity: reverse should not move playhead forward once running.
                     if previous_rev_pts.is_none()
                         || timeline_pos <= self.state.project.playback.playhead
                     {
                         self.state.project.playback.playhead = timeline_pos;
-                    } else {
-                        // #region agent log
-                        crate::agent_debug_log(
-                            "crates/app/src/pipeline.rs:apply_reverse_pipeline_frame",
-                            "Clamped forward reverse-frame playhead jump",
-                            "pre-fix",
-                            "H10",
-                            &format!(
-                                "{{\"playheadBefore\":{:.6},\"candidateTimelinePos\":{:.6},\"framePts\":{:.6},\"prevRevPts\":{},\"mappedSourcePts\":{:.6}}}",
-                                playhead_before,
-                                timeline_pos,
-                                frame.pts_seconds,
-                                previous_rev_pts
-                                    .map(|v| format!("{:.6}", v))
-                                    .unwrap_or_else(|| "null".to_string()),
-                                mapped_source_pts
-                            ),
-                        );
-                        // #endregion
-                    }
-                    let playhead_delta = self.state.project.playback.playhead - playhead_before;
-                    let pts_delta = previous_rev_pts
-                        .map(|prev| frame.pts_seconds - prev)
-                        .unwrap_or(0.0);
-                    if playhead_delta.abs() > 0.12 || pts_delta > 0.001 {
-                        // #region agent log
-                        crate::agent_debug_log(
-                            "crates/app/src/pipeline.rs:apply_reverse_pipeline_frame",
-                            "Reverse frame produced large playhead jump or non-descending pts",
-                            "pre-fix",
-                            "H3",
-                            &format!(
-                                "{{\"playheadBefore\":{:.6},\"playheadAfter\":{:.6},\"playheadDelta\":{:.6},\"framePts\":{:.6},\"prevRevPts\":{},\"ptsDelta\":{:.6},\"mappedSourcePts\":{:.6},\"sourceIn\":{:.6},\"sourceOut\":{:.6}}}",
-                                playhead_before,
-                                self.state.project.playback.playhead,
-                                playhead_delta,
-                                frame.pts_seconds,
-                                previous_rev_pts
-                                    .map(|v| format!("{:.6}", v))
-                                    .unwrap_or_else(|| "null".to_string()),
-                                pts_delta,
-                                mapped_source_pts,
-                                tc.source_in,
-                                tc.source_out
-                            ),
-                        );
-                        // #endregion
                     }
                 } else if mapped_source_pts < tc.source_in {
                     let prev_time = (tc.timeline_start - 0.001).max(0.0);
-                    // #region agent log
-                    crate::agent_debug_log(
-                        "crates/app/src/pipeline.rs:apply_reverse_pipeline_frame",
-                        "Reverse frame underflowed clip; switching to previous clip",
-                        "pre-fix",
-                        "H8",
-                        &format!(
-                            "{{\"mappedSourcePts\":{:.6},\"sourceIn\":{:.6},\"timelineStart\":{:.6},\"prevTime\":{:.6},\"playheadBefore\":{:.6}}}",
-                            mapped_source_pts,
-                            tc.source_in,
-                            tc.timeline_start,
-                            prev_time,
-                            playhead_before
-                        ),
-                    );
-                    // #endregion
                     self.state.project.playback.playhead = prev_time;
                     self.reverse = None;
-                    self.reset_audio_queue();
+                    self.reset_audio_sources();
 
                     if prev_time > 0.0 {
                         if let Some(prev_hit) =

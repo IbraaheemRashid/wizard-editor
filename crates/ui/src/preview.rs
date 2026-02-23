@@ -116,7 +116,8 @@ fn show_black_frame(ui: &mut egui::Ui, available: egui::Vec2) {
             ),
             display_size,
         );
-        ui.painter().rect_filled(rect, egui::CornerRadius::ZERO, egui::Color32::BLACK);
+        ui.painter()
+            .rect_filled(rect, egui::CornerRadius::ZERO, egui::Color32::BLACK);
         ui.painter().rect_stroke(
             rect,
             egui::CornerRadius::ZERO,

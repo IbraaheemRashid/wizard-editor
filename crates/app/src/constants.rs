@@ -1,6 +1,7 @@
 pub const FORWARD_STARTUP_GRACE_S: f64 = 0.22;
+pub const DEBUG_PLAYBACK: bool = false;
 pub const FORWARD_STARTUP_LONG_GRACE_S: f64 = 0.40;
-pub const SHADOW_LOOKAHEAD_S: f64 = 0.5;
+pub const SHADOW_LOOKAHEAD_S: f64 = 3.0;
 pub const STALE_PIPELINE_THRESHOLD_S: f64 = 0.75;
 pub const PIPELINE_STALL_THRESHOLD_S: f64 = 0.08;
 pub const FRAME_GAP_STALL_S: f64 = 0.12;
@@ -9,3 +10,7 @@ pub const HOVER_AUDIO_BUCKET_RATE: f64 = 2.0;
 pub const SCRUB_AUDIO_BUCKET_RATE: f64 = 10.0;
 pub const VIDEO_DECODE_BUCKET_RATE: f64 = 60.0;
 pub const FPS_WINDOW_S: f64 = 0.25;
+pub const SCRUB_DECODE_WIDTH: u32 = 960;
+pub const SCRUB_DECODE_HEIGHT: u32 = 540;
+pub const SCRUB_MAX_DECODE_FRAMES: u32 = 20;
+pub const PLAYBACK_MAX_DECODE_FRAMES: u32 = 180;

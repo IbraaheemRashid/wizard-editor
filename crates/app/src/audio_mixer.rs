@@ -5,29 +5,6 @@ use ringbuf::HeapRb;
 use wizard_audio::output::{AudioConsumer, AudioProducer};
 use wizard_media::pipeline::AudioOnlyHandle;
 
-fn append_debug_log(location: &str, message: &str, hypothesis_id: &str, data_json: String) {
-    use std::fs::OpenOptions;
-    use std::io::Write;
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
-    let id = format!("log_{timestamp}_{hypothesis_id}");
-    if let Ok(mut file) = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("/Users/irashid/personal/wizard-editor/.cursor/debug.log")
-    {
-        let _ = writeln!(
-            file,
-            "{{\"id\":\"{}\",\"timestamp\":{},\"location\":\"{}\",\"message\":\"{}\",\"data\":{},\"runId\":\"audio-resampler-debug\",\"hypothesisId\":\"{}\"}}",
-            id, timestamp, location, message, data_json, hypothesis_id
-        );
-    }
-}
-
 struct AudioSource {
     consumer: AudioConsumer,
     _handle: AudioOnlyHandle,
@@ -37,20 +14,17 @@ pub struct AudioMixer {
     pub output: Arc<Mutex<AudioProducer>>,
     sources: Vec<AudioSource>,
     mix_buf: Vec<f32>,
-    logged_no_input_with_sources: bool,
-    logged_output_backpressure: bool,
 }
 
 const SOURCE_RING_SIZE: usize = 16384;
+const MIX_BUF_MAX: usize = 4096;
 
 impl AudioMixer {
     pub fn new(output: Arc<Mutex<AudioProducer>>) -> Self {
         Self {
             output,
             sources: Vec::new(),
-            mix_buf: Vec::with_capacity(4096),
-            logged_no_input_with_sources: false,
-            logged_output_backpressure: false,
+            mix_buf: vec![0.0f32; MIX_BUF_MAX],
         }
     }
 
@@ -79,55 +53,28 @@ impl AudioMixer {
             .unwrap_or(0);
 
         if max_available == 0 {
-            if !self.logged_no_input_with_sources {
-                // #region agent log
-                append_debug_log(
-                    "crates/app/src/audio_mixer.rs:mix_tick",
-                    "mixer has sources but no available input samples",
-                    "H11",
-                    format!("{{\"sourceCount\":{}}}", self.sources.len()),
-                );
-                // #endregion
-                self.logged_no_input_with_sources = true;
-            }
             return;
         }
 
-        self.mix_buf.clear();
-        self.mix_buf.resize(max_available, 0.0f32);
+        let mix_len = max_available.min(MIX_BUF_MAX);
+        let buf = &mut self.mix_buf[..mix_len];
+        buf.fill(0.0);
 
         for source in &mut self.sources {
             let avail = source.consumer.occupied_len();
-            for i in 0..avail.min(max_available) {
+            for slot in buf.iter_mut().take(avail.min(mix_len)) {
                 if let Some(sample) = source.consumer.try_pop() {
-                    self.mix_buf[i] += sample;
+                    *slot += sample;
                 }
             }
         }
 
-        for sample in &mut self.mix_buf {
+        for sample in buf.iter_mut() {
             *sample = sample.clamp(-1.0, 1.0);
         }
 
         if let Ok(mut producer) = self.output.lock() {
-            let pushed = producer.push_slice(&self.mix_buf);
-            if !self.logged_output_backpressure && pushed < self.mix_buf.len() {
-                // #region agent log
-                append_debug_log(
-                    "crates/app/src/audio_mixer.rs:mix_tick",
-                    "output producer backpressure dropped mixed samples",
-                    "H12",
-                    format!(
-                        "{{\"sourceCount\":{},\"maxAvailable\":{},\"mixLen\":{},\"pushed\":{}}}",
-                        self.sources.len(),
-                        max_available,
-                        self.mix_buf.len(),
-                        pushed
-                    ),
-                );
-                // #endregion
-                self.logged_output_backpressure = true;
-            }
+            producer.push_slice(buf);
         }
     }
 
@@ -137,7 +84,15 @@ impl AudioMixer {
 
     pub fn clear(&mut self) {
         self.sources.clear();
-        self.logged_no_input_with_sources = false;
-        self.logged_output_backpressure = false;
+    }
+
+    pub fn replace_sources(&mut self, new_sources: Vec<(AudioOnlyHandle, AudioConsumer)>) {
+        self.sources.clear();
+        for (handle, consumer) in new_sources {
+            self.sources.push(AudioSource {
+                consumer,
+                _handle: handle,
+            });
+        }
     }
 }

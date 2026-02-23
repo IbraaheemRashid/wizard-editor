@@ -108,6 +108,16 @@ impl VideoDecoder {
         target_width: u32,
         target_height: u32,
     ) -> Option<image::RgbaImage> {
+        self.seek_and_decode_limited(time_seconds, target_width, target_height, 180)
+    }
+
+    pub fn seek_and_decode_limited(
+        &mut self,
+        time_seconds: f64,
+        target_width: u32,
+        target_height: u32,
+        max_frames: u32,
+    ) -> Option<image::RgbaImage> {
         let target_time = time_seconds.max(0.0);
         let ts = (target_time * 1_000_000.0) as i64;
         let _ = self.format_ctx.seek(ts, ..);
@@ -117,7 +127,7 @@ impl VideoDecoder {
         let mut best_before_target: Option<image::RgbaImage> = None;
         let mut last_pts = f64::NEG_INFINITY;
         let mut stagnant_pts_frames = 0_u32;
-        for _ in 0..180 {
+        for _ in 0..max_frames {
             let Some((img, pts)) = self.decode_next_video_frame_inner(target_width, target_height)
             else {
                 break;
@@ -129,8 +139,6 @@ impl VideoDecoder {
                 last_pts = pts;
             }
 
-            // Some MPEG streams expose unreliable/non-advancing PTS around seeks.
-            // Bail out early instead of burning many frames and stalling scrub.
             if stagnant_pts_frames >= 4 {
                 return Some(img);
             }

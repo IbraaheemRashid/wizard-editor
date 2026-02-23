@@ -207,8 +207,12 @@ pub fn timeline_panel(ui: &mut egui::Ui, state: &mut AppState, textures: &dyn Te
             base_clip_color
         };
 
-        let track = state.project.timeline.track_by_id(track_id);
-        let clips: Vec<_> = track.map(|t| t.clips.iter().collect()).unwrap_or_default();
+        let clips: Vec<_> = state
+            .project
+            .timeline
+            .track_by_id(track_id)
+            .map(|t| t.clips.clone())
+            .unwrap_or_default();
 
         for tc in &clips {
             let clip_x = content_left + tc.timeline_start as f32 * pps - scroll;
@@ -450,10 +454,46 @@ pub fn timeline_panel(ui: &mut egui::Ui, state: &mut AppState, textures: &dyn Te
                 state.ui.selection.selected_timeline_clip = Some(tc_id);
                 state.ui.selection.select_single(tc_source_id);
             }
+
+            let is_starred = state.project.starred.contains(&tc_source_id);
+            let has_linked = tc.linked_to.is_some();
+            clip_response.context_menu(|ui| {
+                if has_linked {
+                    if ui.button("Delete").clicked() {
+                        state.project.snapshot_for_undo();
+                        state.project.timeline.remove_clip_single(tc_id);
+                        if state.ui.selection.selected_timeline_clip == Some(tc_id) {
+                            state.ui.selection.selected_timeline_clip = None;
+                        }
+                        ui.close_menu();
+                    }
+                    if ui.button("Delete Both").clicked() {
+                        state.project.snapshot_for_undo();
+                        state.project.timeline.remove_clip(tc_id);
+                        if state.ui.selection.selected_timeline_clip == Some(tc_id) {
+                            state.ui.selection.selected_timeline_clip = None;
+                        }
+                        ui.close_menu();
+                    }
+                } else if ui.button("Delete").clicked() {
+                    state.project.snapshot_for_undo();
+                    state.project.timeline.remove_clip_single(tc_id);
+                    if state.ui.selection.selected_timeline_clip == Some(tc_id) {
+                        state.ui.selection.selected_timeline_clip = None;
+                    }
+                    ui.close_menu();
+                }
+                let star_label = if is_starred { "Unstar" } else { "Star" };
+                if ui.button(star_label).clicked() {
+                    state.project.toggle_star(tc_source_id);
+                    ui.close_menu();
+                }
+            });
         }
     }
 
     if let Some((clip_ids, track_id, position_seconds)) = pending_browser_drop {
+        state.project.snapshot_for_undo();
         let mut cursor = position_seconds;
         for clip_id in clip_ids {
             state.project.add_clip_to_track(clip_id, track_id, cursor);
@@ -539,6 +579,7 @@ pub fn timeline_panel(ui: &mut egui::Ui, state: &mut AppState, textures: &dyn Te
         header_response.context_menu(|ui| {
             let mute_label = if is_muted { "Unmute" } else { "Mute" };
             if ui.button(mute_label).clicked() {
+                state.project.snapshot_for_undo();
                 if let Some(track) = state.project.timeline.track_by_id_mut(track_id) {
                     track.muted = !track.muted;
                 }
@@ -546,6 +587,7 @@ pub fn timeline_panel(ui: &mut egui::Ui, state: &mut AppState, textures: &dyn Te
             }
             let vis_label = if is_visible { "Hide" } else { "Show" };
             if ui.button(vis_label).clicked() {
+                state.project.snapshot_for_undo();
                 if let Some(track) = state.project.timeline.track_by_id_mut(track_id) {
                     track.visible = !track.visible;
                 }
@@ -557,6 +599,7 @@ pub fn timeline_panel(ui: &mut egui::Ui, state: &mut AppState, textures: &dyn Te
                 .add_enabled(can_move_up, egui::Button::new("Move Up"))
                 .clicked()
             {
+                state.project.snapshot_for_undo();
                 state
                     .project
                     .timeline
@@ -568,6 +611,7 @@ pub fn timeline_panel(ui: &mut egui::Ui, state: &mut AppState, textures: &dyn Te
                 .add_enabled(can_move_down, egui::Button::new("Move Down"))
                 .clicked()
             {
+                state.project.snapshot_for_undo();
                 state
                     .project
                     .timeline
@@ -576,6 +620,7 @@ pub fn timeline_panel(ui: &mut egui::Ui, state: &mut AppState, textures: &dyn Te
             }
             ui.separator();
             if ui.button("Add Track Pair").clicked() {
+                state.project.snapshot_for_undo();
                 state.project.timeline.add_track_pair();
                 ui.close_menu();
             }
@@ -584,6 +629,7 @@ pub fn timeline_panel(ui: &mut egui::Ui, state: &mut AppState, textures: &dyn Te
                 .add_enabled(can_delete, egui::Button::new("Delete Track Pair"))
                 .clicked()
             {
+                state.project.snapshot_for_undo();
                 state.project.timeline.remove_track_pair(pair_index);
                 ui.close_menu();
             }
@@ -730,6 +776,7 @@ fn handle_clip_trim(
         let trim_clip_id = trim.clip_id;
         state.ui.timeline.trimming_clip = None;
 
+        state.project.snapshot_for_undo();
         state.project.timeline.finalize_trim(trim_clip_id);
         return;
     }
@@ -847,6 +894,7 @@ fn handle_clip_drag_drop(
         (((pointer.x - content_left + scroll) / pps).max(0.0) as f64 - grab_offset).max(0.0);
     let (new_pos, _) = snap_time_to_clip_boundaries(state, new_pos, pps, Some(src_clip_id));
 
+    state.project.snapshot_for_undo();
     if src_track_id == dst_track_id {
         state
             .project

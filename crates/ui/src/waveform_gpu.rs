@@ -1,6 +1,7 @@
 use std::sync::{Arc, Mutex};
 
 use egui::{Color32, Rect};
+use wgpu::util::DeviceExt;
 
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
@@ -17,7 +18,6 @@ struct WaveformUniforms {
 pub struct WaveformRenderer {
     pipeline: wgpu::RenderPipeline,
     bind_group_layout: wgpu::BindGroupLayout,
-    max_peaks: usize,
 }
 
 impl WaveformRenderer {
@@ -88,12 +88,9 @@ impl WaveformRenderer {
             cache: None,
         });
 
-        let max_peaks = 2048;
-
         Self {
             pipeline,
             bind_group_layout,
-            max_peaks,
         }
     }
 }
@@ -159,7 +156,7 @@ impl egui_wgpu::CallbackTrait for WaveformCallback {
     fn prepare(
         &self,
         device: &wgpu::Device,
-        queue: &wgpu::Queue,
+        _queue: &wgpu::Queue,
         _screen_descriptor: &egui_wgpu::ScreenDescriptor,
         _encoder: &mut wgpu::CommandEncoder,
         callback_resources: &mut egui_wgpu::CallbackResources,
@@ -168,29 +165,22 @@ impl egui_wgpu::CallbackTrait for WaveformCallback {
             .get()
             .expect("WaveformRenderer not initialized");
 
-        let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("waveform_uniforms_per_cb"),
-            size: std::mem::size_of::<WaveformUniforms>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
+        let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("waveform_uniforms"),
+            contents: bytemuck::bytes_of(&self.uniforms),
+            usage: wgpu::BufferUsages::UNIFORM,
         });
 
-        queue.write_buffer(&uniform_buffer, 0, bytemuck::bytes_of(&self.uniforms));
-
-        let peak_buffer_size = (renderer.max_peaks * std::mem::size_of::<[f32; 2]>()) as u64;
-        let peak_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("waveform_peaks_per_cb"),
-            size: peak_buffer_size,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
+        let peak_bytes: &[u8] = if self.peaks_data.is_empty() {
+            &[0u8; 8]
+        } else {
+            bytemuck::cast_slice(&self.peaks_data)
+        };
+        let peak_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("waveform_peaks"),
+            contents: peak_bytes,
+            usage: wgpu::BufferUsages::STORAGE,
         });
-
-        if !self.peaks_data.is_empty() {
-            let byte_data: &[u8] = bytemuck::cast_slice(&self.peaks_data);
-            let max_bytes = renderer.max_peaks * std::mem::size_of::<[f32; 2]>();
-            let write_bytes = byte_data.len().min(max_bytes);
-            queue.write_buffer(&peak_buffer, 0, &byte_data[..write_bytes]);
-        }
 
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("waveform_bind_group"),

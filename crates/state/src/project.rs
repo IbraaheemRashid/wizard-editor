@@ -5,6 +5,7 @@ use crate::playback::Playback;
 use crate::selection::Selection;
 use crate::tag::Tag;
 use crate::timeline::{Timeline, TimelineClipId, TrackId};
+use crate::undo::UndoManager;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrimEdge {
@@ -59,6 +60,7 @@ pub struct ProjectState {
     pub clip_tags: HashMap<ClipId, u32>,
     pub timeline: Timeline,
     pub playback: Playback,
+    pub undo: UndoManager,
 }
 
 impl ProjectState {
@@ -84,6 +86,22 @@ impl ProjectState {
         *entry ^= tag.bit();
     }
 
+    pub fn snapshot_for_undo(&mut self) {
+        self.undo.save(self.timeline.clone());
+    }
+
+    pub fn undo(&mut self) {
+        if let Some(previous) = self.undo.undo(self.timeline.clone()) {
+            self.timeline = previous;
+        }
+    }
+
+    pub fn redo(&mut self) {
+        if let Some(next) = self.undo.redo(self.timeline.clone()) {
+            self.timeline = next;
+        }
+    }
+
     pub fn add_clip_to_track(
         &mut self,
         source_id: ClipId,
@@ -100,9 +118,7 @@ impl ProjectState {
             let audio_track_id = match track_kind {
                 Some((crate::timeline::TrackKind::Audio, _)) => track_id,
                 Some((crate::timeline::TrackKind::Video, _)) => {
-                    self.timeline
-                        .paired_track_id(track_id)
-                        .unwrap_or(track_id)
+                    self.timeline.paired_track_id(track_id).unwrap_or(track_id)
                 }
                 None => track_id,
             };

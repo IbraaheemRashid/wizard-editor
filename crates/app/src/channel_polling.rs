@@ -4,6 +4,8 @@ use wizard_state::playback::PlaybackState;
 use crate::constants::*;
 use crate::EditorApp;
 
+static FIRST_FRAME_LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 impl EditorApp {
     pub fn poll_background_tasks(&mut self, ctx: &egui::Context) {
         let mut received = false;
@@ -111,50 +113,46 @@ impl EditorApp {
                     || (rev_last_frame_time.is_none()
                         && reverse_startup_age > FORWARD_STARTUP_LONG_GRACE_S));
             let current_source = self.last_decoded_frame.map(|(_, s)| s);
+            let forward_awaiting_first = self.forward.is_some()
+                && self.state.project.playback.state == PlaybackState::Playing
+                && !fwd_frame_delivered;
+            let reverse_awaiting_first = self.reverse.is_some()
+                && self.state.project.playback.state == PlaybackState::PlayingReverse
+                && rev_last_frame_time.is_none();
             let should_apply_fallback_texture = (self.state.project.playback.state
                 == PlaybackState::Playing
-                && (self.forward.is_none() || forward_pipeline_stalled))
+                && (self.forward.is_none()
+                    || forward_pipeline_stalled
+                    || forward_awaiting_first))
                 || (self.state.project.playback.state == PlaybackState::PlayingReverse
-                    && (self.reverse.is_none() || reverse_pipeline_stalled))
+                    && (self.reverse.is_none()
+                        || reverse_pipeline_stalled
+                        || reverse_awaiting_first))
                 || self.state.project.playback.state == PlaybackState::Stopped
                 || self.state.ui.timeline.scrubbing.is_some();
             let should_preserve_pipeline_texture = (current_source == Some("fwd")
-                && !forward_long_stall)
-                || (current_source == Some("rev") && !reverse_long_stall);
-            if self.forward.is_some()
-                && self.state.project.playback.state == PlaybackState::Playing
-                && !fwd_frame_delivered
-                && forward_startup_age <= FORWARD_STARTUP_GRACE_S
-            {
-                continue;
-            }
-            if self.reverse.is_some()
-                && self.state.project.playback.state == PlaybackState::PlayingReverse
-                && rev_last_frame_time.is_none()
-                && reverse_startup_age <= FORWARD_STARTUP_GRACE_S
-            {
-                continue;
-            }
+                && !forward_long_stall
+                && !forward_awaiting_first)
+                || (current_source == Some("rev")
+                    && !reverse_long_stall
+                    && !reverse_awaiting_first);
             if !should_apply_fallback_texture {
                 continue;
             }
             if should_preserve_pipeline_texture {
                 continue;
             }
-            let texture = ctx.load_texture(
-                "playback_frame",
-                egui::ColorImage::from_rgba_unmultiplied(
-                    [
-                        result.image.width() as usize,
-                        result.image.height() as usize,
-                    ],
-                    result.image.as_raw(),
-                ),
-                egui::TextureOptions::LINEAR,
+            let img = result.image.as_ref();
+            self.textures.update_playback_texture(
+                ctx,
+                img.width() as usize,
+                img.height() as usize,
+                img.as_raw(),
             );
-            self.textures.playback_texture = Some(texture);
             received = true;
         }
+
+        self.poll_shadow_frame();
 
         let mut pipeline_frames: Vec<DecodedFrame> = Vec::new();
         if let Some(ref fwd) = self.forward {
@@ -162,10 +160,24 @@ impl EditorApp {
                 pipeline_frames.push(frame);
             }
         }
+        if DEBUG_PLAYBACK && !pipeline_frames.is_empty() && !fwd_frame_delivered {
+            let elapsed_ms = fwd_started_at.map(|t| (now - t) * 1000.0).unwrap_or(0.0);
+            let pts = pipeline_frames[0].pts_seconds;
+            eprintln!("[DBG] first pipeline frame arrived, latency={elapsed_ms:.1}ms, pts={pts:.3}");
+            FIRST_FRAME_LOGGED.store(false, std::sync::atomic::Ordering::Relaxed);
+        }
         for frame in &pipeline_frames {
             received = true;
             if !self.apply_pipeline_frame(ctx, frame, now) {
                 break;
+            }
+        }
+        if let Some(ref fwd) = self.forward {
+            for mut frame in pipeline_frames {
+                let buf = std::mem::take(&mut frame.rgba_data);
+                if !buf.is_empty() {
+                    fwd.handle.return_buffer(buf);
+                }
             }
         }
 
@@ -188,7 +200,7 @@ impl EditorApp {
         }
         if let Some(snippet) = last_snippet {
             if !self.is_playing() {
-                self.reset_audio_queue();
+                self.reset_audio_sources();
             }
             if let Ok(mut producer) = self.audio_producer.lock() {
                 let ch = self.audio_channels;
