@@ -106,7 +106,8 @@ pub fn spawn_scrub_cache_worker() -> ScrubCacheWorkerChannels {
                 }
             };
 
-            let frame_count = ((duration * SCRUB_CACHE_FPS).ceil() as usize).clamp(1, SCRUB_CACHE_MAX_FRAMES);
+            let frame_count =
+                ((duration * SCRUB_CACHE_FPS).ceil() as usize).clamp(1, SCRUB_CACHE_MAX_FRAMES);
 
             let (frame_tx, frame_rx) = mpsc::channel();
             wizard_media::thumbnail::extract_frames_streaming(

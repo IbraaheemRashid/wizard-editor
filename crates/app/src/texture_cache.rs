@@ -12,7 +12,10 @@ impl ScrubCacheEntry {
         if self.pts.is_empty() {
             return None;
         }
-        let idx = match self.pts.binary_search_by(|p| p.partial_cmp(&source_time).unwrap_or(std::cmp::Ordering::Equal)) {
+        let idx = match self.pts.binary_search_by(|p| {
+            p.partial_cmp(&source_time)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        }) {
             Ok(i) => i,
             Err(0) => 0,
             Err(i) if i >= self.pts.len() => self.pts.len() - 1,
@@ -87,6 +90,8 @@ impl wizard_ui::TextureLookup for TextureCache {
     }
 
     fn scrub_frame_at_time(&self, id: &ClipId, source_time: f64) -> Option<&egui::TextureHandle> {
-        self.scrub_frames.get(id).and_then(|entry| entry.frame_at_time(source_time))
+        self.scrub_frames
+            .get(id)
+            .and_then(|entry| entry.frame_at_time(source_time))
     }
 }

@@ -131,9 +131,7 @@ fn show_black_frame(ui: &mut egui::Ui, available: egui::Vec2) {
 fn show_frame_texture(ui: &mut egui::Ui, tex: &egui::TextureHandle, available: egui::Vec2) {
     let tex_size = tex.size_vec2();
     let video_h = available.y - 8.0;
-    let scale = (available.x / tex_size.x)
-        .min(video_h / tex_size.y)
-        .min(1.0);
+    let scale = (available.x / tex_size.x).min(video_h / tex_size.y);
     let display_size = tex_size * scale;
 
     let vertical_pad = (available.y - display_size.y) / 2.0;

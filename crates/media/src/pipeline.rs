@@ -239,14 +239,20 @@ fn spawn_demuxer(
             };
             let debug = cfg!(debug_assertions) || std::env::var("DEBUG_PLAYBACK").is_ok();
             if debug {
-                eprintln!("[DBG:demux] file opened, {:.1}ms", t0.elapsed().as_secs_f64() * 1000.0);
+                eprintln!(
+                    "[DBG:demux] file opened, {:.1}ms",
+                    t0.elapsed().as_secs_f64() * 1000.0
+                );
             }
 
             if start_time_seconds > 0.01 {
                 let ts = (start_time_seconds * 1_000_000.0) as i64;
                 let _ = format_ctx.seek(ts, ..);
                 if debug {
-                    eprintln!("[DBG:demux] seeked to {start_time_seconds:.3}s, {:.1}ms", t0.elapsed().as_secs_f64() * 1000.0);
+                    eprintln!(
+                        "[DBG:demux] seeked to {start_time_seconds:.3}s, {:.1}ms",
+                        t0.elapsed().as_secs_f64() * 1000.0
+                    );
                 }
             }
 
@@ -265,7 +271,10 @@ fn spawn_demuxer(
                 }
 
                 if debug && first_packet {
-                    eprintln!("[DBG:demux] first packet read, {:.1}ms", t0.elapsed().as_secs_f64() * 1000.0);
+                    eprintln!(
+                        "[DBG:demux] first packet read, {:.1}ms",
+                        t0.elapsed().as_secs_f64() * 1000.0
+                    );
                     first_packet = false;
                 }
 
@@ -319,7 +328,10 @@ fn spawn_video_decoder(
                 return;
             };
             if debug {
-                eprintln!("[DBG:vdec] codec ready, {:.1}ms", t0.elapsed().as_secs_f64() * 1000.0);
+                eprintln!(
+                    "[DBG:vdec] codec ready, {:.1}ms",
+                    t0.elapsed().as_secs_f64() * 1000.0
+                );
             }
 
             let mut scaler: Option<(scaling::Context, u32, u32, Pixel, u32, u32)> = None;
@@ -361,7 +373,10 @@ fn spawn_video_decoder(
                     }
 
                     if debug && !*first_frame_logged {
-                        eprintln!("[DBG:vdec] first frame decoded (not skipped), pts={pts:.3}, {:.1}ms", t0.elapsed().as_secs_f64() * 1000.0);
+                        eprintln!(
+                            "[DBG:vdec] first frame decoded (not skipped), pts={pts:.3}, {:.1}ms",
+                            t0.elapsed().as_secs_f64() * 1000.0
+                        );
                         *first_frame_logged = true;
                     }
 
@@ -376,7 +391,10 @@ fn spawn_video_decoder(
                         convert_video_frame(frame, scaler, target_w, target_h, &mut buf)
                     {
                         if debug && !*first_send_logged {
-                            eprintln!("[DBG:vdec] first frame scaled, {:.1}ms", t0.elapsed().as_secs_f64() * 1000.0);
+                            eprintln!(
+                                "[DBG:vdec] first frame scaled, {:.1}ms",
+                                t0.elapsed().as_secs_f64() * 1000.0
+                            );
                         }
                         let delay = clock.delay(pts);
                         if !delay.is_zero() {
@@ -391,7 +409,10 @@ fn spawn_video_decoder(
                             })
                             .is_ok();
                         if debug && !*first_send_logged {
-                            eprintln!("[DBG:vdec] first frame sent to channel, {:.1}ms", t0.elapsed().as_secs_f64() * 1000.0);
+                            eprintln!(
+                                "[DBG:vdec] first frame sent to channel, {:.1}ms",
+                                t0.elapsed().as_secs_f64() * 1000.0
+                            );
                             *first_send_logged = true;
                         }
                         ok
@@ -407,8 +428,14 @@ fn spawn_video_decoder(
                 let Ok(packet) = packet_rx.recv() else {
                     let _ = decoder.send_eof();
                     while decoder.receive_frame(&mut decoded_frame).is_ok() {
-                        if !process_frame(&decoded_frame, &mut scaler, &mut skipping, &mut buf_pool, &mut first_frame_logged, &mut first_send_logged)
-                        {
+                        if !process_frame(
+                            &decoded_frame,
+                            &mut scaler,
+                            &mut skipping,
+                            &mut buf_pool,
+                            &mut first_frame_logged,
+                            &mut first_send_logged,
+                        ) {
                             return;
                         }
                     }
@@ -416,7 +443,10 @@ fn spawn_video_decoder(
                 };
 
                 if debug && !first_packet_logged {
-                    eprintln!("[DBG:vdec] first packet recv, {:.1}ms", t0.elapsed().as_secs_f64() * 1000.0);
+                    eprintln!(
+                        "[DBG:vdec] first packet recv, {:.1}ms",
+                        t0.elapsed().as_secs_f64() * 1000.0
+                    );
                     first_packet_logged = true;
                 }
 
@@ -425,7 +455,14 @@ fn spawn_video_decoder(
                 }
 
                 while decoder.receive_frame(&mut decoded_frame).is_ok() {
-                    if !process_frame(&decoded_frame, &mut scaler, &mut skipping, &mut buf_pool, &mut first_frame_logged, &mut first_send_logged) {
+                    if !process_frame(
+                        &decoded_frame,
+                        &mut scaler,
+                        &mut skipping,
+                        &mut buf_pool,
+                        &mut first_frame_logged,
+                        &mut first_send_logged,
+                    ) {
                         return;
                     }
                 }
@@ -517,6 +554,36 @@ fn convert_video_frame(
 }
 
 const GOP_WINDOW: f64 = 4.0;
+static MEDIA_AUDIO_PUSH_LOG_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn emit_media_debug_log(
+    hypothesis_id: &str,
+    location: &str,
+    message: &str,
+    data: serde_json::Value,
+) {
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let payload = serde_json::json!({
+        "id": format!("log_{}_media", timestamp),
+        "timestamp": timestamp,
+        "location": location,
+        "message": message,
+        "data": data,
+        "runId": "initial",
+        "hypothesisId": hypothesis_id
+    });
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/Users/irashid/personal/wizard-editor/.cursor/debug.log")
+    {
+        let _ = std::io::Write::write_all(&mut file, payload.to_string().as_bytes());
+        let _ = std::io::Write::write_all(&mut file, b"\n");
+    }
+}
 
 pub struct ReversePipelineHandle {
     frame_rx: mpsc::Receiver<DecodedFrame>,
@@ -951,8 +1018,58 @@ fn push_resampled_f32(
     }
 
     if let Ok(mut guard) = producer.lock() {
-        return guard.push_slice(&buf);
+        let pushed = guard.push_slice(&buf);
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let last = MEDIA_AUDIO_PUSH_LOG_MS.load(std::sync::atomic::Ordering::Relaxed);
+        if now_ms.saturating_sub(last) > 500 {
+            MEDIA_AUDIO_PUSH_LOG_MS.store(now_ms, std::sync::atomic::Ordering::Relaxed);
+            // #region agent log
+            emit_media_debug_log(
+                "H9",
+                "crates/media/src/pipeline.rs:push_resampled_f32",
+                "audio decoder pushed samples to source ring",
+                serde_json::json!({
+                    "frameSamples": samples,
+                    "bufferLen": buf.len(),
+                    "pushed": pushed,
+                    "outputChannels": output_channels
+                }),
+            );
+            // #endregion
+        }
+        if pushed == 0 && !buf.is_empty() {
+            // #region agent log
+            emit_media_debug_log(
+                "H10",
+                "crates/media/src/pipeline.rs:push_resampled_f32",
+                "audio decoder push dropped all samples",
+                serde_json::json!({
+                    "frameSamples": samples,
+                    "bufferLen": buf.len(),
+                    "outputChannels": output_channels
+                }),
+            );
+            // #endregion
+        }
+        return pushed;
     }
+
+    // #region agent log
+    emit_media_debug_log(
+        "H10",
+        "crates/media/src/pipeline.rs:push_resampled_f32",
+        "audio decoder failed to lock source ring producer",
+        serde_json::json!({
+            "frameSamples": samples,
+            "bufferLen": buf.len(),
+            "outputChannels": output_channels
+        }),
+    );
+    // #endregion
     0
 }
 

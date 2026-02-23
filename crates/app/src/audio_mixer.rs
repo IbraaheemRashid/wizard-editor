@@ -16,8 +16,10 @@ pub struct AudioMixer {
     mix_buf: Vec<f32>,
 }
 
-const SOURCE_RING_SIZE: usize = 16384;
+const SOURCE_RING_SIZE: usize = 65536;
 const MIX_BUF_MAX: usize = 4096;
+static LAST_MIXER_UNDERFLOW_LOG_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 impl AudioMixer {
     pub fn new(output: Arc<Mutex<AudioProducer>>) -> Self {
@@ -53,6 +55,25 @@ impl AudioMixer {
             .unwrap_or(0);
 
         if max_available == 0 {
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            let last = LAST_MIXER_UNDERFLOW_LOG_MS.load(std::sync::atomic::Ordering::Relaxed);
+            if now_ms.saturating_sub(last) > 500 {
+                LAST_MIXER_UNDERFLOW_LOG_MS.store(now_ms, std::sync::atomic::Ordering::Relaxed);
+                // #region agent log
+                crate::debug_log::emit(
+                    "H4",
+                    "crates/app/src/audio_mixer.rs:mix_tick",
+                    "audio mixer underflow detected",
+                    serde_json::json!({
+                        "sourceCount": self.sources.len(),
+                        "maxAvailableSamples": max_available
+                    }),
+                );
+                // #endregion
+            }
             return;
         }
 
