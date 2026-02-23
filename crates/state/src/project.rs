@@ -90,12 +90,26 @@ impl ProjectState {
         track_id: TrackId,
         position_seconds: f64,
     ) {
-        let duration = self
-            .clips
-            .get(&source_id)
-            .and_then(|c| c.duration)
-            .unwrap_or(3.0)
-            .max(0.1);
+        let clip = self.clips.get(&source_id);
+        let duration = clip.and_then(|c| c.duration).unwrap_or(3.0).max(0.1);
+        let audio_only = clip.map(|c| c.audio_only).unwrap_or(false);
+
+        let track_kind = self.timeline.track_index_and_kind(track_id);
+
+        if audio_only {
+            let audio_track_id = match track_kind {
+                Some((crate::timeline::TrackKind::Audio, _)) => track_id,
+                Some((crate::timeline::TrackKind::Video, _)) => {
+                    self.timeline
+                        .paired_track_id(track_id)
+                        .unwrap_or(track_id)
+                }
+                None => track_id,
+            };
+            self.timeline
+                .add_clip_to_track(source_id, audio_track_id, position_seconds, duration);
+            return;
+        }
 
         let paired = self.timeline.paired_track_id(track_id);
 
@@ -127,7 +141,6 @@ pub struct BrowserUiState {
     pub hover_active_clip: Option<ClipId>,
     pub hover_started_at: Option<f64>,
     pub hovered_scrub_t: Option<f32>,
-    pub show_browser: bool,
 }
 
 impl Default for BrowserUiState {
@@ -144,7 +157,6 @@ impl Default for BrowserUiState {
             hover_active_clip: None,
             hover_started_at: None,
             hovered_scrub_t: None,
-            show_browser: true,
         }
     }
 }

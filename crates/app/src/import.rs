@@ -21,10 +21,13 @@ impl EditorApp {
         let wtx = self.waveform_tx.clone();
         std::thread::spawn(move || {
             let meta = wizard_media::metadata::extract_metadata(&p);
+            let has_video = meta.has_video;
             let _ = mtx.send((clip_id, meta));
 
-            if let Some(img) = wizard_media::thumbnail::extract_thumbnail(&p) {
-                let _ = ttx.send((clip_id, img));
+            if has_video {
+                if let Some(img) = wizard_media::thumbnail::extract_thumbnail(&p) {
+                    let _ = ttx.send((clip_id, img));
+                }
             }
 
             let peaks = wizard_media::audio::extract_waveform_peaks(&p, 512);
@@ -51,9 +54,7 @@ impl EditorApp {
                 for p in event.paths {
                     if p.is_file() {
                         if let Some(ext) = p.extension().and_then(|e| e.to_str()) {
-                            if wizard_media::import::VIDEO_EXTENSIONS
-                                .contains(&ext.to_lowercase().as_str())
-                            {
+                            if wizard_media::import::is_media_extension(ext) {
                                 let _ = tx.send(p);
                             }
                         }

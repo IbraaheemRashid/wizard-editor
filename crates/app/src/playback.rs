@@ -24,9 +24,11 @@ impl EditorApp {
     }
 
     pub fn reset_audio_queue(&mut self) {
+        self.mixer.clear();
         if let Some(ref output) = self.audio_output {
             let producer = output.swap_buffer();
             self.audio_producer = Arc::new(Mutex::new(producer));
+            self.mixer.output = self.audio_producer.clone();
         }
     }
 
@@ -66,7 +68,7 @@ impl EditorApp {
             let _ = self.enqueue_preview_request(clip_id, true);
         }
 
-        if let Some(clip_id) = self.state.ui.selection.selected_clip {
+        if let Some(clip_id) = self.state.ui.selection.primary_clip() {
             let _ = self.enqueue_preview_request(clip_id, true);
         }
 
@@ -211,9 +213,14 @@ impl EditorApp {
             && self.state.project.playback.state == PlaybackState::Playing
             && (forward_frame_gap_stalled
                 || (!fwd_frame_delivered && forward_startup_age > FORWARD_STARTUP_GRACE_S));
+        let rev_last_frame_time = self.reverse.as_ref().and_then(|r| r.last_frame_time);
+        let rev_started_at = self.reverse.as_ref().map(|r| r.started_at);
+        let reverse_startup_age = rev_started_at.map(|t| now - t).unwrap_or(f64::INFINITY);
         let reverse_pipeline_stalled = self.reverse.is_some()
             && self.state.project.playback.state == PlaybackState::PlayingReverse
-            && last_frame_time.is_none_or(|t| (now - t) > PIPELINE_STALL_THRESHOLD_S);
+            && (rev_last_frame_time.is_some_and(|t| (now - t) > PIPELINE_STALL_THRESHOLD_S)
+                || (rev_last_frame_time.is_none()
+                    && reverse_startup_age > FORWARD_STARTUP_GRACE_S));
         if (self.forward.is_some() && !forward_pipeline_stalled)
             || (self.reverse.is_some() && !reverse_pipeline_stalled)
         {
@@ -221,6 +228,13 @@ impl EditorApp {
                 && self.state.project.playback.state == PlaybackState::Playing
                 && !fwd_frame_delivered
                 && forward_startup_age <= FORWARD_STARTUP_GRACE_S
+            {
+                return;
+            }
+            if self.reverse.is_some()
+                && self.state.project.playback.state == PlaybackState::PlayingReverse
+                && rev_last_frame_time.is_none()
+                && reverse_startup_age <= FORWARD_STARTUP_GRACE_S
             {
                 return;
             }
@@ -241,7 +255,7 @@ impl EditorApp {
             playhead
         };
 
-        if let Some(hit) = self.state.project.timeline.clip_at_time(time) {
+        if let Some(hit) = self.state.project.timeline.video_clip_at_time(time) {
             if let Some(clip) = self.state.project.clips.get(&hit.clip.source_id) {
                 let bucket = (hit.source_time * VIDEO_DECODE_BUCKET_RATE).round() as i64;
                 if self.last_video_decode_request == Some((hit.clip.source_id, bucket)) {

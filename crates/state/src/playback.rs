@@ -66,9 +66,6 @@ impl Playback {
             self.playhead = 0.0;
             self.state = PlaybackState::Stopped;
         }
-        if duration > 0.0 && self.playhead >= duration {
-            self.playhead = duration;
-            self.state = PlaybackState::Stopped;
-        }
+        let _ = duration;
     }
 }

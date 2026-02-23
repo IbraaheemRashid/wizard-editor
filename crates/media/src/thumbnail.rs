@@ -62,11 +62,35 @@ pub fn extract_preview_frames_streaming(
     };
 
     let actual_count = count.max(1);
-    for i in 0..actual_count {
-        let t = i as f64 * duration / actual_count as f64;
-        if let Some(img) = decoder.seek_and_decode(t, PREVIEW_WIDTH, PREVIEW_HEIGHT) {
-            if sender.send((i, img)).is_err() {
+    let targets: Vec<f64> = (0..actual_count)
+        .map(|i| i as f64 * duration / actual_count as f64)
+        .collect();
+
+    decoder.seek(0.0);
+
+    let mut next_idx = 0;
+    loop {
+        if next_idx >= actual_count {
+            break;
+        }
+
+        let Some((img, pts)) =
+            decoder.decode_next_frame_with_pts(PREVIEW_WIDTH, PREVIEW_HEIGHT)
+        else {
+            break;
+        };
+
+        if pts + 0.001 >= targets[next_idx] {
+            if sender.send((next_idx, img.clone())).is_err() {
                 return;
+            }
+            next_idx += 1;
+
+            while next_idx < actual_count && pts + 0.001 >= targets[next_idx] {
+                if sender.send((next_idx, img.clone())).is_err() {
+                    return;
+                }
+                next_idx += 1;
             }
         }
     }

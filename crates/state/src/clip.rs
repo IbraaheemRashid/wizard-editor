@@ -27,6 +27,7 @@ pub struct Clip {
     pub duration: Option<f64>,
     pub resolution: Option<(u32, u32)>,
     pub codec: Option<String>,
+    pub audio_only: bool,
     pub search_haystack: String,
 }
 
@@ -51,6 +52,7 @@ impl Clip {
             duration: None,
             resolution: None,
             codec: None,
+            audio_only: false,
             search_haystack,
         }
     }

@@ -25,6 +25,8 @@ struct TrackLayout {
     name: String,
     display_index: usize,
     pair_index: usize,
+    muted: bool,
+    visible: bool,
 }
 
 fn build_track_layout(state: &AppState) -> Vec<TrackLayout> {
@@ -37,6 +39,8 @@ fn build_track_layout(state: &AppState) -> Vec<TrackLayout> {
             name: track.name.clone(),
             display_index: idx,
             pair_index: pair_i,
+            muted: track.muted,
+            visible: track.visible,
         });
         idx += 1;
     }
@@ -47,6 +51,8 @@ fn build_track_layout(state: &AppState) -> Vec<TrackLayout> {
             name: track.name.clone(),
             display_index: idx,
             pair_index: pair_i,
+            muted: track.muted,
+            visible: track.visible,
         });
         idx += 1;
     }
@@ -101,9 +107,6 @@ pub fn timeline_panel(ui: &mut egui::Ui, state: &mut AppState, textures: &dyn Te
     ui.set_min_width(0.0);
     ui.set_min_height(0.0);
 
-    ui.heading("Timeline");
-    ui.separator();
-
     let available = ui.available_rect_before_wrap();
     let timeline_rect = Rect::from_min_size(available.min, available.size());
     ui.allocate_rect(timeline_rect, Sense::hover());
@@ -130,33 +133,18 @@ pub fn timeline_panel(ui: &mut egui::Ui, state: &mut AppState, textures: &dyn Te
     let v_scroll = state.ui.timeline.vertical_scroll_offset;
     let ruler_top = timeline_rect.min.y;
 
-    draw_ruler(ui, content_left, ruler_top, content_width, pps, scroll);
-
     let clip_area_top = ruler_top + RULER_HEIGHT;
     let clip_area_bottom = timeline_rect.max.y - SCROLLBAR_HEIGHT - 8.0;
-    let available_track_area = clip_area_bottom - clip_area_top;
 
-    let centered_offset = if needs_vertical_scroll {
-        0.0
-    } else {
-        (available_track_area - total_track_height).max(0.0) * 0.5
-    };
+    let tracks_top = clip_area_top - v_scroll;
 
-    let tracks_top = clip_area_top + centered_offset - v_scroll;
-
-    let mut pending_browser_drop: Option<(ClipId, TrackId, f64)> = None;
+    let mut pending_browser_drop: Option<(Vec<ClipId>, TrackId, f64)> = None;
 
     let content_clip_rect = Rect::from_min_max(
         pos2(content_left, clip_area_top),
         pos2(content_left + content_width, clip_area_bottom),
     );
     let content_painter = ui.painter().with_clip_rect(content_clip_rect);
-
-    let header_clip_rect = Rect::from_min_max(
-        pos2(timeline_rect.min.x, clip_area_top),
-        pos2(content_left, clip_area_bottom),
-    );
-    let header_painter = ui.painter().with_clip_rect(header_clip_rect);
 
     let full_track_clip_rect = Rect::from_min_max(
         pos2(timeline_rect.min.x, clip_area_top),
@@ -174,49 +162,6 @@ pub fn timeline_panel(ui: &mut egui::Ui, state: &mut AppState, textures: &dyn Te
         let track_id = layout.track_id;
         let y = tracks_top + layout.display_index as f32 * (TRACK_HEIGHT + 2.0);
 
-        let header_rect = Rect::from_min_size(
-            pos2(timeline_rect.min.x, y),
-            vec2(TRACK_HEADER_WIDTH, TRACK_HEIGHT),
-        );
-        header_painter.rect_filled(header_rect, CornerRadius::ZERO, theme::TRACK_HEADER_BG);
-        header_painter.line_segment(
-            [
-                pos2(header_rect.max.x, header_rect.min.y),
-                pos2(header_rect.max.x, header_rect.max.y),
-            ],
-            Stroke::new(1.0, theme::BORDER),
-        );
-        header_painter.text(
-            header_rect.center(),
-            egui::Align2::CENTER_CENTER,
-            &layout.name,
-            egui::FontId::proportional(12.0),
-            theme::TEXT_PRIMARY,
-        );
-
-        let header_response = ui.interact(
-            header_rect,
-            egui::Id::new(("track_header", track_id)),
-            Sense::click(),
-        );
-
-        let pair_index = layout.pair_index;
-        let pair_count = state.project.timeline.pair_count();
-        header_response.context_menu(|ui| {
-            if ui.button("Add Track Pair").clicked() {
-                state.project.timeline.add_track_pair();
-                ui.close_menu();
-            }
-            let can_delete = pair_count > 1;
-            if ui
-                .add_enabled(can_delete, egui::Button::new("Delete Track Pair"))
-                .clicked()
-            {
-                state.project.timeline.remove_track_pair(pair_index);
-                ui.close_menu();
-            }
-        });
-
         let track_rect =
             Rect::from_min_size(pos2(content_left, y), vec2(content_width, TRACK_HEIGHT));
 
@@ -226,11 +171,11 @@ pub fn timeline_panel(ui: &mut egui::Ui, state: &mut AppState, textures: &dyn Te
             Sense::hover(),
         );
 
-        if let Some(payload) = track_response.dnd_release_payload::<ClipId>() {
+        if let Some(payload) = track_response.dnd_release_payload::<Vec<ClipId>>() {
             if let Some(pointer) = ui.ctx().pointer_interact_pos() {
                 let drop_t = ((pointer.x - content_left + scroll) / pps).max(0.0) as f64;
                 let (t, _) = snap_time_to_clip_boundaries(state, drop_t, pps, None);
-                pending_browser_drop = Some((*payload, track_id, t));
+                pending_browser_drop = Some((payload.as_ref().clone(), track_id, t));
             }
         }
 
@@ -243,7 +188,7 @@ pub fn timeline_panel(ui: &mut egui::Ui, state: &mut AppState, textures: &dyn Te
             Stroke::new(1.0, theme::BORDER),
         );
 
-        if track_response.dnd_hover_payload::<ClipId>().is_some() {
+        if track_response.dnd_hover_payload::<Vec<ClipId>>().is_some() {
             content_painter.rect_stroke(
                 track_rect,
                 CornerRadius::ZERO,
@@ -252,9 +197,14 @@ pub fn timeline_panel(ui: &mut egui::Ui, state: &mut AppState, textures: &dyn Te
             );
         }
 
-        let clip_color = match layout.kind {
+        let base_clip_color = match layout.kind {
             TrackKind::Video => theme::CLIP_VIDEO,
             TrackKind::Audio => theme::CLIP_AUDIO,
+        };
+        let clip_color = if layout.muted || !layout.visible {
+            base_clip_color.gamma_multiply(0.3)
+        } else {
+            base_clip_color
         };
 
         let track = state.project.timeline.track_by_id(track_id);
@@ -498,23 +448,156 @@ pub fn timeline_panel(ui: &mut egui::Ui, state: &mut AppState, textures: &dyn Te
 
             if clip_response.clicked() && state.ui.timeline.trimming_clip.is_none() {
                 state.ui.selection.selected_timeline_clip = Some(tc_id);
-                state.ui.selection.selected_clip = Some(tc_source_id);
+                state.ui.selection.select_single(tc_source_id);
             }
         }
     }
 
-    if let Some((clip_id, track_id, position_seconds)) = pending_browser_drop {
-        state
-            .project
-            .add_clip_to_track(clip_id, track_id, position_seconds);
+    if let Some((clip_ids, track_id, position_seconds)) = pending_browser_drop {
+        let mut cursor = position_seconds;
+        for clip_id in clip_ids {
+            state.project.add_clip_to_track(clip_id, track_id, cursor);
+            let dur = state
+                .project
+                .clips
+                .get(&clip_id)
+                .and_then(|c| c.duration)
+                .unwrap_or(3.0)
+                .max(0.1);
+            cursor += dur;
+        }
     }
 
     let total_tracks = state.project.timeline.track_count();
 
-    draw_drag_ghosts(ui, state, tracks_top, content_left, pps, scroll, textures);
+    draw_drag_ghosts(
+        ui,
+        state,
+        tracks_top,
+        content_left,
+        pps,
+        scroll,
+        textures,
+        content_clip_rect,
+    );
 
     handle_clip_trim(ui, state, content_left, pps, scroll, tracks_top);
     handle_clip_drag_drop(ui, state, tracks_top, content_left, pps, scroll);
+
+    let header_clip_rect = Rect::from_min_max(
+        pos2(timeline_rect.min.x, clip_area_top),
+        pos2(content_left, clip_area_bottom),
+    );
+    let header_column_bg = Rect::from_min_max(
+        pos2(timeline_rect.min.x, clip_area_top),
+        pos2(content_left, clip_area_bottom),
+    );
+    ui.painter()
+        .rect_filled(header_column_bg, CornerRadius::ZERO, theme::BG_PANEL);
+
+    let header_painter = ui.painter().with_clip_rect(header_clip_rect);
+    let track_layouts_for_headers = build_track_layout(state);
+    for layout in &track_layouts_for_headers {
+        let track_id = layout.track_id;
+        let y = tracks_top + layout.display_index as f32 * (TRACK_HEIGHT + 2.0);
+
+        let header_rect = Rect::from_min_size(
+            pos2(timeline_rect.min.x, y),
+            vec2(TRACK_HEADER_WIDTH, TRACK_HEIGHT),
+        );
+        let header_bg = if layout.muted || !layout.visible {
+            theme::TRACK_HEADER_BG.gamma_multiply(0.6)
+        } else {
+            theme::TRACK_HEADER_BG
+        };
+        header_painter.rect_filled(header_rect, CornerRadius::ZERO, header_bg);
+        header_painter.line_segment(
+            [
+                pos2(header_rect.max.x, header_rect.min.y),
+                pos2(header_rect.max.x, header_rect.max.y),
+            ],
+            Stroke::new(1.0, theme::BORDER),
+        );
+        header_painter.text(
+            header_rect.center(),
+            egui::Align2::CENTER_CENTER,
+            &layout.name,
+            egui::FontId::proportional(12.0),
+            theme::TEXT_PRIMARY,
+        );
+
+        let header_response = ui.interact(
+            header_rect,
+            egui::Id::new(("track_header", track_id)),
+            Sense::click(),
+        );
+
+        let pair_index = layout.pair_index;
+        let pair_count = state.project.timeline.pair_count();
+        let is_muted = layout.muted;
+        let is_visible = layout.visible;
+        header_response.context_menu(|ui| {
+            let mute_label = if is_muted { "Unmute" } else { "Mute" };
+            if ui.button(mute_label).clicked() {
+                if let Some(track) = state.project.timeline.track_by_id_mut(track_id) {
+                    track.muted = !track.muted;
+                }
+                ui.close_menu();
+            }
+            let vis_label = if is_visible { "Hide" } else { "Show" };
+            if ui.button(vis_label).clicked() {
+                if let Some(track) = state.project.timeline.track_by_id_mut(track_id) {
+                    track.visible = !track.visible;
+                }
+                ui.close_menu();
+            }
+            ui.separator();
+            let can_move_up = pair_index + 1 < pair_count;
+            if ui
+                .add_enabled(can_move_up, egui::Button::new("Move Up"))
+                .clicked()
+            {
+                state
+                    .project
+                    .timeline
+                    .move_track_pair(pair_index, pair_index + 1);
+                ui.close_menu();
+            }
+            let can_move_down = pair_index > 0;
+            if ui
+                .add_enabled(can_move_down, egui::Button::new("Move Down"))
+                .clicked()
+            {
+                state
+                    .project
+                    .timeline
+                    .move_track_pair(pair_index, pair_index - 1);
+                ui.close_menu();
+            }
+            ui.separator();
+            if ui.button("Add Track Pair").clicked() {
+                state.project.timeline.add_track_pair();
+                ui.close_menu();
+            }
+            let can_delete = pair_count > 1;
+            if ui
+                .add_enabled(can_delete, egui::Button::new("Delete Track Pair"))
+                .clicked()
+            {
+                state.project.timeline.remove_track_pair(pair_index);
+                ui.close_menu();
+            }
+        });
+    }
+
+    draw_ruler(ui, content_left, ruler_top, content_width, pps, scroll);
+
+    let corner_rect = Rect::from_min_size(
+        pos2(timeline_rect.min.x, ruler_top),
+        vec2(TRACK_HEADER_WIDTH, RULER_HEIGHT),
+    );
+    ui.painter()
+        .rect_filled(corner_rect, CornerRadius::ZERO, theme::RULER_BG);
 
     let playhead_time = state.project.playback.playhead;
     let mut playhead_x = content_left + playhead_time as f32 * pps - scroll;
@@ -555,24 +638,22 @@ pub fn timeline_panel(ui: &mut egui::Ui, state: &mut AppState, textures: &dyn Te
         }
     }
 
-    let playhead_top = ruler_top;
-    let playhead_bottom = clip_area_bottom;
-    let playhead_clip = Rect::from_min_max(
-        pos2(content_left, playhead_top),
-        pos2(content_left + content_width, playhead_bottom),
+    let playhead_body_clip = Rect::from_min_max(
+        pos2(content_left, clip_area_top),
+        pos2(content_left + content_width, clip_area_bottom),
     );
-    let playhead_painter = ui.painter().with_clip_rect(playhead_clip);
-    playhead_painter.line_segment(
+    let playhead_body_painter = ui.painter().with_clip_rect(playhead_body_clip);
+    playhead_body_painter.line_segment(
         [
-            pos2(playhead_x, playhead_top),
-            pos2(playhead_x, playhead_bottom),
+            pos2(playhead_x, clip_area_top),
+            pos2(playhead_x, clip_area_bottom),
         ],
         Stroke::new(1.5, theme::PLAYHEAD_COLOR),
     );
 
-    let playhead_head =
-        Rect::from_center_size(pos2(playhead_x, playhead_top + 4.0), vec2(10.0, 8.0));
-    playhead_painter.rect_filled(playhead_head, CornerRadius::same(2), theme::PLAYHEAD_COLOR);
+    let playhead_head_painter = ui.painter();
+    let playhead_head = Rect::from_center_size(pos2(playhead_x, ruler_top + 4.0), vec2(10.0, 8.0));
+    playhead_head_painter.rect_filled(playhead_head, CornerRadius::same(2), theme::PLAYHEAD_COLOR);
 
     if needs_vertical_scroll {
         draw_vertical_scrollbar(
@@ -965,6 +1046,7 @@ struct ClipGhostParams<'a> {
     textures: &'a dyn TextureLookup,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_drag_ghosts(
     ui: &mut egui::Ui,
     state: &AppState,
@@ -973,6 +1055,7 @@ fn draw_drag_ghosts(
     pps: f32,
     scroll: f32,
     textures: &dyn TextureLookup,
+    content_clip_rect: Rect,
 ) {
     let pointer = match ui.ctx().pointer_hover_pos() {
         Some(p) => p,
@@ -1012,63 +1095,69 @@ fn draw_drag_ghosts(
         paired_id.and_then(|pid| track_layouts.iter().position(|l| l.track_id == pid));
 
     if !has_timeline_drag {
-        if let Some(payload) = DragAndDrop::payload::<ClipId>(ui.ctx()) {
-            let clip_id = *payload;
-            let duration = state
-                .project
-                .clips
-                .get(&clip_id)
-                .and_then(|c| c.duration)
-                .unwrap_or(3.0)
-                .max(0.1);
-            let clip_color = match target_kind {
-                TrackKind::Video => theme::CLIP_VIDEO,
-                TrackKind::Audio => theme::CLIP_AUDIO,
-            };
-            let track_y = tracks_top + target_display_idx as f32 * (TRACK_HEIGHT + 2.0);
-            draw_clip_ghost(
-                ui,
-                &ClipGhostParams {
-                    clip_id: &clip_id,
-                    duration,
-                    drop_time,
-                    track_y,
-                    content_left,
-                    pps,
-                    scroll,
-                    clip_color,
-                    track_kind: target_kind,
-                    tracks_top,
-                    num_tracks,
-                    state,
-                    textures,
-                },
-            );
-            if let Some(p_idx) = paired_display_idx {
-                let paired_kind = track_layouts[p_idx].kind;
-                let paired_color = match paired_kind {
+        if let Some(payload) = DragAndDrop::payload::<Vec<ClipId>>(ui.ctx()) {
+            let clip_ids = payload.as_ref();
+            let mut cursor = drop_time;
+            for clip_id in clip_ids {
+                let duration = state
+                    .project
+                    .clips
+                    .get(clip_id)
+                    .and_then(|c| c.duration)
+                    .unwrap_or(3.0)
+                    .max(0.1);
+                let clip_color = match target_kind {
                     TrackKind::Video => theme::CLIP_VIDEO,
                     TrackKind::Audio => theme::CLIP_AUDIO,
                 };
-                let paired_y = tracks_top + p_idx as f32 * (TRACK_HEIGHT + 2.0);
+                let track_y = tracks_top + target_display_idx as f32 * (TRACK_HEIGHT + 2.0);
                 draw_clip_ghost(
                     ui,
+                    content_clip_rect,
                     &ClipGhostParams {
-                        clip_id: &clip_id,
+                        clip_id,
                         duration,
-                        drop_time,
-                        track_y: paired_y,
+                        drop_time: cursor,
+                        track_y,
                         content_left,
                         pps,
                         scroll,
-                        clip_color: paired_color,
-                        track_kind: paired_kind,
+                        clip_color,
+                        track_kind: target_kind,
                         tracks_top,
                         num_tracks,
                         state,
                         textures,
                     },
                 );
+                if let Some(p_idx) = paired_display_idx {
+                    let paired_kind = track_layouts[p_idx].kind;
+                    let paired_color = match paired_kind {
+                        TrackKind::Video => theme::CLIP_VIDEO,
+                        TrackKind::Audio => theme::CLIP_AUDIO,
+                    };
+                    let paired_y = tracks_top + p_idx as f32 * (TRACK_HEIGHT + 2.0);
+                    draw_clip_ghost(
+                        ui,
+                        content_clip_rect,
+                        &ClipGhostParams {
+                            clip_id,
+                            duration,
+                            drop_time: cursor,
+                            track_y: paired_y,
+                            content_left,
+                            pps,
+                            scroll,
+                            clip_color: paired_color,
+                            track_kind: paired_kind,
+                            tracks_top,
+                            num_tracks,
+                            state,
+                            textures,
+                        },
+                    );
+                }
+                cursor += duration;
             }
         }
     }
@@ -1093,6 +1182,7 @@ fn draw_drag_ghosts(
                 let track_y = tracks_top + target_display_idx as f32 * (TRACK_HEIGHT + 2.0);
                 draw_clip_ghost(
                     ui,
+                    content_clip_rect,
                     &ClipGhostParams {
                         clip_id: &clip_id,
                         duration,
@@ -1122,6 +1212,7 @@ fn draw_drag_ghosts(
                             let linked_y = tracks_top + l_idx as f32 * (TRACK_HEIGHT + 2.0);
                             draw_clip_ghost(
                                 ui,
+                                content_clip_rect,
                                 &ClipGhostParams {
                                     clip_id: &clip_id,
                                     duration,
@@ -1146,7 +1237,7 @@ fn draw_drag_ghosts(
     }
 }
 
-fn draw_clip_ghost(ui: &mut egui::Ui, p: &ClipGhostParams<'_>) {
+fn draw_clip_ghost(ui: &mut egui::Ui, clip_rect: Rect, p: &ClipGhostParams<'_>) {
     let ghost_x = p.content_left + p.drop_time as f32 * p.pps - p.scroll;
     let ghost_w = p.duration as f32 * p.pps;
     let ghost_rect = Rect::from_min_size(
@@ -1154,12 +1245,13 @@ fn draw_clip_ghost(ui: &mut egui::Ui, p: &ClipGhostParams<'_>) {
         vec2(ghost_w, TRACK_HEIGHT - 4.0),
     );
 
+    let painter = ui.painter().with_clip_rect(clip_rect);
+
     let ghost_color =
         Color32::from_rgba_unmultiplied(p.clip_color.r(), p.clip_color.g(), p.clip_color.b(), 100);
-    ui.painter()
-        .rect_filled(ghost_rect, theme::ROUNDING_SM, ghost_color);
+    painter.rect_filled(ghost_rect, theme::ROUNDING_SM, ghost_color);
 
-    ui.painter().rect_stroke(
+    painter.rect_stroke(
         ghost_rect,
         theme::ROUNDING_SM,
         Stroke::new(1.0, Color32::from_white_alpha(80)),
@@ -1175,7 +1267,7 @@ fn draw_clip_ghost(ui: &mut egui::Ui, p: &ClipGhostParams<'_>) {
         if let Some(tex) = p.textures.thumbnail(p.clip_id) {
             let uv = Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
             let tint = Color32::from_rgba_unmultiplied(255, 255, 255, 100);
-            ui.painter().image(tex.id(), thumb_rect, uv, tint);
+            painter.image(tex.id(), thumb_rect, uv, tint);
         }
     }
 
@@ -1186,7 +1278,7 @@ fn draw_clip_ghost(ui: &mut egui::Ui, p: &ClipGhostParams<'_>) {
         } else {
             name.to_string()
         };
-        ui.painter().text(
+        painter.text(
             pos2(ghost_rect.min.x + 4.0, ghost_rect.center().y),
             egui::Align2::LEFT_CENTER,
             label,
@@ -1197,7 +1289,7 @@ fn draw_clip_ghost(ui: &mut egui::Ui, p: &ClipGhostParams<'_>) {
 
     let line_top = p.tracks_top;
     let line_bottom = p.tracks_top + p.num_tracks as f32 * (TRACK_HEIGHT + 2.0);
-    ui.painter().line_segment(
+    painter.line_segment(
         [pos2(ghost_x, line_top), pos2(ghost_x, line_bottom)],
         Stroke::new(1.0, Color32::from_white_alpha(120)),
     );
@@ -1206,7 +1298,7 @@ fn draw_clip_ghost(ui: &mut egui::Ui, p: &ClipGhostParams<'_>) {
     let minutes = (total_secs / 60.0).floor() as i32;
     let secs = total_secs % 60.0;
     let time_label = format!("{minutes}:{secs:04.1}");
-    ui.painter().text(
+    painter.text(
         pos2(ghost_x + 2.0, p.track_y - 2.0),
         egui::Align2::LEFT_BOTTOM,
         time_label,

@@ -55,6 +55,8 @@ pub struct Track {
     pub name: String,
     pub kind: TrackKind,
     pub clips: Vec<TimelineClip>,
+    pub muted: bool,
+    pub visible: bool,
 }
 
 impl Track {
@@ -64,6 +66,8 @@ impl Track {
             name: name.into(),
             kind,
             clips: Vec::new(),
+            muted: false,
+            visible: true,
         }
     }
 
@@ -223,31 +227,51 @@ impl Timeline {
         None
     }
 
-    fn clip_at_time_in<'a>(
-        tracks: impl Iterator<Item = &'a Track>,
-        time: f64,
-    ) -> Option<PlayheadHit> {
-        for track in tracks {
-            for tc in &track.clips {
-                if time >= tc.timeline_start && time < tc.timeline_start + tc.duration {
-                    let source_time = tc.source_in + (time - tc.timeline_start);
-                    return Some(PlayheadHit {
-                        track_id: track.id,
-                        clip: tc.clone(),
-                        source_time,
-                    });
-                }
+    fn clip_at_time_in_track(track: &Track, time: f64) -> Option<PlayheadHit> {
+        for tc in &track.clips {
+            if time >= tc.timeline_start && time < tc.timeline_start + tc.duration {
+                let source_time = tc.source_in + (time - tc.timeline_start);
+                return Some(PlayheadHit {
+                    track_id: track.id,
+                    clip: tc.clone(),
+                    source_time,
+                });
             }
         }
         None
     }
 
-    pub fn clip_at_time(&self, time: f64) -> Option<PlayheadHit> {
-        Self::clip_at_time_in(self.all_tracks(), time)
+    pub fn video_clip_at_time(&self, time: f64) -> Option<PlayheadHit> {
+        for track in &self.video_tracks {
+            if !track.visible {
+                continue;
+            }
+            if let Some(hit) = Self::clip_at_time_in_track(track, time) {
+                return Some(hit);
+            }
+        }
+        None
+    }
+
+    pub fn audio_clips_at_time(&self, time: f64) -> Vec<PlayheadHit> {
+        let mut hits = Vec::new();
+        for track in &self.audio_tracks {
+            if track.muted {
+                continue;
+            }
+            if let Some(hit) = Self::clip_at_time_in_track(track, time) {
+                hits.push(hit);
+            }
+        }
+        hits
     }
 
     pub fn audio_clip_at_time(&self, time: f64) -> Option<PlayheadHit> {
-        Self::clip_at_time_in(self.audio_tracks.iter(), time)
+        self.audio_clips_at_time(time).into_iter().next()
+    }
+
+    pub fn has_unmuted_audio_at_time(&self, time: f64) -> bool {
+        !self.audio_clips_at_time(time).is_empty()
     }
 
     pub fn timeline_duration(&self) -> f64 {
@@ -582,13 +606,36 @@ impl Timeline {
     pub fn next_clip_after(&self, id: TimelineClipId) -> Option<PlayheadHit> {
         let (_, _, tc) = self.find_clip(id)?;
         let next_time = tc.timeline_start + tc.duration;
-        self.clip_at_time(next_time)
+        self.video_clip_at_time(next_time)
     }
 
     pub fn time_remaining_in_clip(&self, id: TimelineClipId, playhead: f64) -> Option<f64> {
         let (_, _, tc) = self.find_clip(id)?;
         let clip_end = tc.timeline_start + tc.duration;
         Some((clip_end - playhead).max(0.0))
+    }
+}
+
+impl Timeline {
+    pub fn move_video_track(&mut self, from: usize, to: usize) {
+        if from >= self.video_tracks.len() || to >= self.video_tracks.len() || from == to {
+            return;
+        }
+        let track = self.video_tracks.remove(from);
+        self.video_tracks.insert(to, track);
+    }
+
+    pub fn move_audio_track(&mut self, from: usize, to: usize) {
+        if from >= self.audio_tracks.len() || to >= self.audio_tracks.len() || from == to {
+            return;
+        }
+        let track = self.audio_tracks.remove(from);
+        self.audio_tracks.insert(to, track);
+    }
+
+    pub fn move_track_pair(&mut self, from: usize, to: usize) {
+        self.move_video_track(from, to);
+        self.move_audio_track(from, to);
     }
 }
 

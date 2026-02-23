@@ -5,6 +5,15 @@ pub const VIDEO_EXTENSIONS: &[&str] = &[
     "mpeg", "vob", "3gp", "3g2", "ogv", "f4v", "divx", "asf", "rm", "rmvb", "dv", "r3d", "braw",
 ];
 
+pub const AUDIO_EXTENSIONS: &[&str] = &[
+    "wav", "mp3", "aac", "flac", "ogg", "m4a", "wma", "aiff", "aif", "opus", "alac",
+];
+
+pub fn is_media_extension(ext: &str) -> bool {
+    let lower = ext.to_lowercase();
+    VIDEO_EXTENSIONS.contains(&lower.as_str()) || AUDIO_EXTENSIONS.contains(&lower.as_str())
+}
+
 pub fn scan_folder(path: &Path) -> Vec<PathBuf> {
     let mut results = Vec::new();
     let mut stack = vec![path.to_path_buf()];
@@ -18,7 +27,7 @@ pub fn scan_folder(path: &Path) -> Vec<PathBuf> {
                 stack.push(p);
             } else if p.is_file() {
                 if let Some(ext) = p.extension().and_then(|e| e.to_str()) {
-                    if VIDEO_EXTENSIONS.contains(&ext.to_lowercase().as_str()) {
+                    if is_media_extension(ext) {
                         results.push(p);
                     }
                 }

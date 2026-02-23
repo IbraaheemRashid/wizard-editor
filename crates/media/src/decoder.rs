@@ -143,6 +143,13 @@ impl VideoDecoder {
         best_before_target
     }
 
+    pub fn seek(&mut self, time_seconds: f64) {
+        let ts = (time_seconds.max(0.0) * 1_000_000.0) as i64;
+        let _ = self.format_ctx.seek(ts, ..);
+        self.decoder.flush();
+        self.last_decode_ts = None;
+    }
+
     pub fn decode_next_frame(
         &mut self,
         target_width: u32,
@@ -150,6 +157,14 @@ impl VideoDecoder {
     ) -> Option<image::RgbaImage> {
         self.decode_next_video_frame_inner(target_width, target_height)
             .map(|(img, _)| img)
+    }
+
+    pub fn decode_next_frame_with_pts(
+        &mut self,
+        target_width: u32,
+        target_height: u32,
+    ) -> Option<(image::RgbaImage, f64)> {
+        self.decode_next_video_frame_inner(target_width, target_height)
     }
 
     pub fn last_decode_time(&self) -> Option<f64> {

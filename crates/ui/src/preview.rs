@@ -20,8 +20,10 @@ pub fn preview_panel(ui: &mut egui::Ui, state: &mut AppState, textures: &dyn Tex
         if let Some(tex) = textures.playback_frame() {
             show_frame_texture(ui, tex, egui::vec2(available.x, video_area_height));
         }
+    } else if is_active {
+        show_black_frame(ui, egui::vec2(available.x, video_area_height));
     } else if !is_active {
-        match state.ui.selection.selected_clip {
+        match state.ui.selection.primary_clip() {
             Some(clip_id) => {
                 if let Some(clip) = state.project.clips.get(&clip_id) {
                     ui.vertical_centered(|ui| {
@@ -59,18 +61,15 @@ pub fn preview_panel(ui: &mut egui::Ui, state: &mut AppState, textures: &dyn Tex
 
 fn transport_bar(ui: &mut egui::Ui, state: &mut AppState) {
     let playhead = state.project.playback.playhead;
-    let total_secs = playhead;
-    let minutes = (total_secs / 60.0).floor() as i32;
-    let secs = total_secs % 60.0;
+    let minutes = (playhead / 60.0).floor() as i32;
+    let secs = playhead % 60.0;
     let frames = ((secs.fract()) * 24.0).floor() as i32;
     let timecode = format!("{minutes}:{:02}.{frames:02}", secs.floor() as i32);
 
     let is_playing = state.project.playback.state == PlaybackState::Playing;
-    let is_reverse = state.project.playback.state == PlaybackState::PlayingReverse;
-    let is_active = is_playing || is_reverse;
 
     ui.horizontal(|ui| {
-        ui.add_space(ui.available_width() / 2.0 - 120.0);
+        ui.add_space(ui.available_width() / 2.0 - 60.0);
 
         let btn = constants::TRANSPORT_BTN_SIZE;
 
@@ -82,31 +81,6 @@ fn transport_bar(ui: &mut egui::Ui, state: &mut AppState) {
             state.project.playback.playhead = 0.0;
         }
 
-        if ui
-            .add_sized(btn, egui::Button::new("\u{23EA}"))
-            .on_hover_text("Rewind 5s")
-            .clicked()
-        {
-            state.project.playback.playhead = (state.project.playback.playhead - 5.0).max(0.0);
-        }
-
-        let reverse_label = if is_reverse { "\u{25FC}" } else { "\u{25C0}" };
-        if ui
-            .add_sized(btn, egui::Button::new(reverse_label))
-            .on_hover_text(if is_reverse {
-                "Stop reverse"
-            } else {
-                "Play reverse"
-            })
-            .clicked()
-        {
-            if is_reverse {
-                state.project.playback.stop();
-            } else {
-                state.project.playback.play_reverse();
-            }
-        }
-
         let play_label = if is_playing { "\u{23F8}" } else { "\u{25B6}" };
         if ui
             .add_sized(btn, egui::Button::new(play_label))
@@ -116,40 +90,40 @@ fn transport_bar(ui: &mut egui::Ui, state: &mut AppState) {
             state.project.playback.toggle_play();
         }
 
-        if ui
-            .add_sized(btn, egui::Button::new("\u{23E9}"))
-            .on_hover_text("Forward 5s")
-            .clicked()
-        {
-            state.project.playback.playhead += 5.0;
-        }
-
-        if ui
-            .add_sized(btn, egui::Button::new("\u{25FC}"))
-            .on_hover_text("Stop")
-            .clicked()
-        {
-            state.project.playback.stop();
-            state.project.playback.playhead = 0.0;
-        }
-
         ui.add_space(8.0);
         ui.label(
             egui::RichText::new(timecode)
                 .font(egui::FontId::monospace(12.0))
                 .color(theme::TEXT_PRIMARY),
         );
+    });
+}
 
-        if is_active {
-            let speed = state.project.playback.speed;
-            if (speed - 1.0).abs() > 0.01 {
-                ui.label(
-                    egui::RichText::new(format!("{speed:.1}x"))
-                        .font(egui::FontId::monospace(10.0))
-                        .color(theme::TEXT_DIM),
-                );
-            }
-        }
+fn show_black_frame(ui: &mut egui::Ui, available: egui::Vec2) {
+    let aspect = 16.0 / 9.0;
+    let video_h = available.y - 8.0;
+    let w = (video_h * aspect).min(available.x);
+    let h = w / aspect;
+    let display_size = egui::vec2(w, h);
+    let vertical_pad = (available.y - display_size.y) / 2.0;
+
+    ui.vertical_centered(|ui| {
+        ui.add_space(vertical_pad.max(0.0));
+        let rect = egui::Rect::from_min_size(
+            egui::pos2(
+                ui.available_rect_before_wrap().center().x - display_size.x / 2.0,
+                ui.cursor().min.y,
+            ),
+            display_size,
+        );
+        ui.painter().rect_filled(rect, egui::CornerRadius::ZERO, egui::Color32::BLACK);
+        ui.painter().rect_stroke(
+            rect,
+            egui::CornerRadius::ZERO,
+            egui::Stroke::new(1.0, theme::BORDER),
+            egui::StrokeKind::Outside,
+        );
+        ui.allocate_space(display_size);
     });
 }
 

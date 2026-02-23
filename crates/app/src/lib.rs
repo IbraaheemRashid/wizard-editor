@@ -1,3 +1,4 @@
+mod audio_mixer;
 mod channel_polling;
 mod constants;
 mod import;
@@ -7,9 +8,12 @@ pub mod texture_cache;
 pub mod workers;
 
 use std::collections::HashSet;
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use notify::RecommendedWatcher;
 use wizard_audio::output::{AudioOutput, AudioProducer};
@@ -18,6 +22,7 @@ use wizard_state::clip::ClipId;
 use wizard_state::playback::PlaybackState;
 use wizard_state::project::AppState;
 
+use audio_mixer::AudioMixer;
 use pipeline::{ForwardPipelineState, ReversePipelineState, ShadowPipelineState};
 use texture_cache::TextureCache;
 use workers::audio_worker::AudioWorkerChannels;
@@ -25,6 +30,32 @@ use workers::preview_worker::PreviewWorkerChannels;
 use workers::video_decode_worker::VideoDecodeWorkerChannels;
 
 use crate::constants::*;
+
+pub(crate) fn agent_debug_log(
+    location: &str,
+    message: &str,
+    run_id: &str,
+    hypothesis_id: &str,
+    data_json: &str,
+) {
+    const DEBUG_LOG_PATH: &str = "/Users/irashid/personal/wizard-editor/.cursor/debug.log";
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let id = format!("log_{}_{}", timestamp, hypothesis_id);
+    let line = format!(
+        "{{\"id\":\"{}\",\"timestamp\":{},\"location\":\"{}\",\"message\":\"{}\",\"data\":{},\"runId\":\"{}\",\"hypothesisId\":\"{}\"}}\n",
+        id, timestamp, location, message, data_json, run_id, hypothesis_id
+    );
+    if let Ok(mut file) = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(DEBUG_LOG_PATH)
+    {
+        let _ = file.write_all(line.as_bytes());
+    }
+}
 
 pub struct EditorApp {
     state: AppState,
@@ -39,6 +70,7 @@ pub struct EditorApp {
     audio_producer: Arc<Mutex<AudioProducer>>,
     audio_sample_rate: u32,
     audio_channels: u16,
+    mixer: AudioMixer,
     audio: AudioWorkerChannels,
     last_hover_audio_request: Option<(ClipId, i64)>,
     last_scrub_audio_request: Option<(ClipId, i64)>,
@@ -105,6 +137,9 @@ impl EditorApp {
         let audio = workers::audio_worker::spawn_audio_worker(no_audio_paths.clone());
         let (watch_tx, watch_rx) = mpsc::channel::<PathBuf>();
 
+        let audio_producer = Arc::new(Mutex::new(audio_producer));
+        let mixer = AudioMixer::new(audio_producer.clone());
+
         Self {
             state: AppState::default(),
             textures: TextureCache::default(),
@@ -115,9 +150,10 @@ impl EditorApp {
             meta_rx,
             preview,
             audio_output,
-            audio_producer: Arc::new(Mutex::new(audio_producer)),
+            audio_producer,
             audio_sample_rate,
             audio_channels,
+            mixer,
             audio,
             last_hover_audio_request: None,
             last_scrub_audio_request: None,
@@ -154,6 +190,8 @@ impl eframe::App for EditorApp {
             let last_frame_time = self.last_pipeline_frame_time();
             let fwd_frame_delivered = self.pipeline_frame_delivered();
             let fwd_started_at = self.forward.as_ref().map(|f| f.started_at);
+            let rev_last_frame_time = self.reverse.as_ref().and_then(|r| r.last_frame_time);
+            let rev_started_at = self.reverse.as_ref().map(|r| r.started_at);
             let recent_pipeline_frame =
                 last_frame_time.is_some_and(|t| (now - t) <= PIPELINE_STALL_THRESHOLD_S);
             let pipeline_delivering = (self.forward.is_some() || self.reverse.is_some())
@@ -163,9 +201,18 @@ impl eframe::App for EditorApp {
                 && self.forward.is_some()
                 && !fwd_frame_delivered
                 && fwd_started_at.is_some_and(|t| (now - t) <= FORWARD_STARTUP_GRACE_S);
+            let reverse_startup_hold = self.state.project.playback.state
+                == PlaybackState::PlayingReverse
+                && self.reverse.is_some()
+                && rev_last_frame_time.is_none()
+                && rev_started_at.is_some_and(|t| (now - t) <= FORWARD_STARTUP_GRACE_S);
             let is_playing_forward = self.state.project.playback.state == PlaybackState::Playing;
-            let should_use_clock_advance = (!pipeline_delivering || is_playing_forward)
+            let is_playing_reverse =
+                self.state.project.playback.state == PlaybackState::PlayingReverse;
+            let should_use_clock_advance = (!pipeline_delivering || is_playing_forward
+                || is_playing_reverse)
                 && !forward_startup_hold
+                && !reverse_startup_hold
                 && self.state.project.playback.state != PlaybackState::Stopped;
             if should_use_clock_advance {
                 self.state.project.playback.advance(dt, duration);
@@ -206,39 +253,18 @@ impl eframe::App for EditorApp {
                 });
             });
 
-        if self.state.ui.browser.show_browser {
-            let mut action = wizard_ui::browser::BrowserAction::None;
-            egui::SidePanel::left("browser_panel")
-                .width_range(200.0..=1200.0)
-                .default_width(425.0)
-                .show(ctx, |ui| {
-                    action = wizard_ui::browser::browser_panel(ui, &mut self.state, &self.textures);
-                });
-            match action {
-                wizard_ui::browser::BrowserAction::None => {}
-                wizard_ui::browser::BrowserAction::Collapse => {
-                    self.state.ui.browser.show_browser = false;
-                }
-                wizard_ui::browser::BrowserAction::ImportFolder(path) => {
-                    self.import_folder(path);
-                }
+        let mut action = wizard_ui::browser::BrowserAction::None;
+        egui::SidePanel::left("browser_panel")
+            .width_range(200.0..=1200.0)
+            .default_width(425.0)
+            .show(ctx, |ui| {
+                action = wizard_ui::browser::browser_panel(ui, &mut self.state, &self.textures);
+            });
+        match action {
+            wizard_ui::browser::BrowserAction::None => {}
+            wizard_ui::browser::BrowserAction::ImportFolder(path) => {
+                self.import_folder(path);
             }
-        } else {
-            egui::SidePanel::left("browser_panel_collapsed")
-                .exact_width(32.0)
-                .resizable(false)
-                .show(ctx, |ui| {
-                    ui.vertical_centered(|ui| {
-                        ui.add_space(4.0);
-                        if ui
-                            .button("\u{25B6}")
-                            .on_hover_text("Show browser")
-                            .clicked()
-                        {
-                            self.state.ui.browser.show_browser = true;
-                        }
-                    });
-                });
         }
 
         self.enqueue_visible_previews();

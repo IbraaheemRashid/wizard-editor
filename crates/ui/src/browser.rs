@@ -12,7 +12,6 @@ use crate::TextureLookup;
 
 pub enum BrowserAction {
     None,
-    Collapse,
     ImportFolder(PathBuf),
 }
 
@@ -26,96 +25,85 @@ pub fn browser_panel(
     state.ui.browser.visible_clips.clear();
 
     let mut action = BrowserAction::None;
-    egui::ScrollArea::both()
+
+    ui.horizontal(|ui| {
+        ui.heading("Media Browser");
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui.button("Import Folder").clicked() {
+                if let Some(path) = rfd::FileDialog::new().pick_folder() {
+                    action = BrowserAction::ImportFolder(path);
+                }
+            }
+        });
+    });
+    ui.separator();
+
+    ui.horizontal(|ui| {
+        let search_width = ui.available_width() - 80.0;
+        ui.add(
+            egui::TextEdit::singleline(&mut state.ui.browser.search_query)
+                .desired_width(search_width),
+        );
+        let star_label = if state.ui.browser.starred_only {
+            "\u{2605} Starred"
+        } else {
+            "\u{2606} Starred"
+        };
+        if ui
+            .selectable_label(state.ui.browser.starred_only, star_label)
+            .clicked()
+        {
+            state.ui.browser.starred_only = !state.ui.browser.starred_only;
+        }
+    });
+    ui.separator();
+
+    ui.horizontal_wrapped(|ui| {
+        for tag in Tag::ALL {
+            let is_selected = (state.ui.browser.tag_filter_mask & tag.bit()) != 0;
+            if ui.selectable_label(is_selected, tag.label()).clicked() {
+                state.ui.browser.tag_filter_mask ^= tag.bit();
+            }
+        }
+        if state.ui.browser.tag_filter_mask != 0 && ui.button("Clear").clicked() {
+            state.ui.browser.tag_filter_mask = 0;
+        }
+    });
+    ui.horizontal(|ui| {
+        let current_label = state.ui.browser.sort_mode.label();
+        egui::ComboBox::from_id_salt("sort_mode")
+            .selected_text(current_label)
+            .show_ui(ui, |ui| {
+                for &mode in SortMode::ALL {
+                    ui.selectable_value(&mut state.ui.browser.sort_mode, mode, mode.label());
+                }
+            });
+        let label = if state.ui.browser.sort_ascending {
+            "A-Z"
+        } else {
+            "Z-A"
+        };
+        if ui
+            .button(label)
+            .on_hover_text("Toggle sort direction")
+            .clicked()
+        {
+            state.ui.browser.sort_ascending = !state.ui.browser.sort_ascending;
+        }
+    });
+    ui.separator();
+
+    let filtered = state.filtered_clips();
+    let clip_count = filtered.len();
+
+    if clip_count == 0 {
+        ui.colored_label(theme::TEXT_DIM, "No clips. Import a folder to begin.");
+        return action;
+    }
+
+    egui::ScrollArea::vertical()
         .auto_shrink([false, false])
         .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.heading("Media Browser");
-                if ui
-                    .button("\u{25C0}")
-                    .on_hover_text("Collapse browser")
-                    .clicked()
-                {
-                    action = BrowserAction::Collapse;
-                }
-            });
-            ui.separator();
-
-            ui.horizontal(|ui| {
-                if ui.button("Import Folder").clicked() {
-                    if let Some(path) = rfd::FileDialog::new().pick_folder() {
-                        action = BrowserAction::ImportFolder(path);
-                    }
-                }
-            });
-
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                ui.label("Search:");
-                ui.text_edit_singleline(&mut state.ui.browser.search_query);
-                let star_label = if state.ui.browser.starred_only {
-                    "\u{2605} Starred"
-                } else {
-                    "\u{2606} Starred"
-                };
-                if ui
-                    .selectable_label(state.ui.browser.starred_only, star_label)
-                    .clicked()
-                {
-                    state.ui.browser.starred_only = !state.ui.browser.starred_only;
-                }
-            });
-
-            ui.add_space(2.0);
-            ui.horizontal_wrapped(|ui| {
-                ui.label("Tags:");
-                for tag in Tag::ALL {
-                    let is_selected = (state.ui.browser.tag_filter_mask & tag.bit()) != 0;
-                    if ui.selectable_label(is_selected, tag.label()).clicked() {
-                        state.ui.browser.tag_filter_mask ^= tag.bit();
-                    }
-                }
-                if state.ui.browser.tag_filter_mask != 0 && ui.button("Clear").clicked() {
-                    state.ui.browser.tag_filter_mask = 0;
-                }
-            });
-            ui.add_space(2.0);
-            ui.horizontal(|ui| {
-                ui.label("Sort:");
-                let current_label = state.ui.browser.sort_mode.label();
-                egui::ComboBox::from_id_salt("sort_mode")
-                    .selected_text(current_label)
-                    .show_ui(ui, |ui| {
-                        for &mode in SortMode::ALL {
-                            ui.selectable_value(
-                                &mut state.ui.browser.sort_mode,
-                                mode,
-                                mode.label(),
-                            );
-                        }
-                    });
-                let label = if state.ui.browser.sort_ascending {
-                    "A-Z"
-                } else {
-                    "Z-A"
-                };
-                if ui
-                    .button(label)
-                    .on_hover_text("Toggle sort direction")
-                    .clicked()
-                {
-                    state.ui.browser.sort_ascending = !state.ui.browser.sort_ascending;
-                }
-            });
-            ui.add_space(4.0);
-
-            let filtered = state.filtered_clips();
-            let clip_count = filtered.len();
-            if clip_count == 0 {
-                ui.colored_label(theme::TEXT_DIM, "No clips. Import a folder to begin.");
-                return;
-            }
-
             let available_width = ui.available_width().max(1.0);
 
             let cols = ((available_width + constants::GRID_SPACING)
@@ -131,12 +119,12 @@ pub fn browser_panel(
             let thumb_size = vec2(tile_w, thumb_h);
 
             let mut is_any_tile_hovered = false;
-            egui::Grid::new("clip_grid")
+            egui::Grid::new(egui::Id::new("clip_grid").with(cols))
                 .spacing(vec2(constants::GRID_SPACING, constants::GRID_SPACING))
                 .show(ui, |ui| {
                     for (i, clip_id) in filtered.iter().enumerate() {
                         is_any_tile_hovered |=
-                            clip_thumbnail(ui, *clip_id, thumb_size, state, textures);
+                            clip_thumbnail(ui, *clip_id, thumb_size, state, textures, &filtered);
                         if (i + 1) % cols == 0 {
                             ui.end_row();
                         }
@@ -150,8 +138,8 @@ pub fn browser_panel(
         });
 
     if let Some(pointer) = ui.ctx().pointer_interact_pos() {
-        if let Some(payload) = egui::DragAndDrop::payload::<ClipId>(ui.ctx()) {
-            let dragged_id = *payload;
+        if let Some(payload) = egui::DragAndDrop::payload::<Vec<ClipId>>(ui.ctx()) {
+            let dragged_ids = payload.as_ref();
             let painter = ui.ctx().layer_painter(egui::LayerId::new(
                 egui::Order::Tooltip,
                 Id::new("drag_preview"),
@@ -160,29 +148,48 @@ pub fn browser_panel(
             let preview_rect = Rect::from_min_size(pointer + vec2(8.0, 8.0), preview_size);
             let tint = Color32::WHITE.gamma_multiply(0.7);
             let uv = Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
-            if let Some(tex) = textures.thumbnail(&dragged_id) {
-                painter.image(tex.id(), preview_rect, uv, tint);
-            } else {
-                painter.rect_filled(
-                    preview_rect,
-                    theme::ROUNDING,
-                    theme::BG_SURFACE.gamma_multiply(0.7),
-                );
-            }
-            if let Some(clip) = state.project.clips.get(&dragged_id) {
-                let name = clip.display_name();
-                let label = if name.len() > 14 {
-                    format!("{}...", &name[..11])
+
+            let first_id = dragged_ids.first();
+            if let Some(first) = first_id {
+                if let Some(tex) = textures.thumbnail(first) {
+                    painter.image(tex.id(), preview_rect, uv, tint);
                 } else {
-                    name.to_string()
-                };
+                    painter.rect_filled(
+                        preview_rect,
+                        theme::ROUNDING,
+                        theme::BG_SURFACE.gamma_multiply(0.7),
+                    );
+                }
+            }
+
+            if dragged_ids.len() > 1 {
+                let badge_pos = egui::pos2(preview_rect.max.x - 4.0, preview_rect.min.y - 4.0);
+                let badge_size = vec2(20.0, 16.0);
+                let badge_rect = Rect::from_min_size(badge_pos, badge_size);
+                painter.rect_filled(badge_rect, 8.0, theme::ACCENT);
                 painter.text(
-                    egui::pos2(preview_rect.center().x, preview_rect.max.y + 2.0),
-                    egui::Align2::CENTER_TOP,
-                    label,
+                    badge_rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    format!("{}", dragged_ids.len()),
                     egui::FontId::proportional(10.0),
-                    theme::TEXT_PRIMARY,
+                    Color32::WHITE,
                 );
+            } else if let Some(first) = first_id {
+                if let Some(clip) = state.project.clips.get(first) {
+                    let name = clip.display_name();
+                    let label = if name.len() > 14 {
+                        format!("{}...", &name[..11])
+                    } else {
+                        name.to_string()
+                    };
+                    painter.text(
+                        egui::pos2(preview_rect.center().x, preview_rect.max.y + 2.0),
+                        egui::Align2::CENTER_TOP,
+                        label,
+                        egui::FontId::proportional(10.0),
+                        theme::TEXT_PRIMARY,
+                    );
+                }
             }
         }
     }
@@ -196,6 +203,7 @@ fn clip_thumbnail(
     thumb_size: Vec2,
     state: &mut AppState,
     textures: &dyn TextureLookup,
+    filtered: &[ClipId],
 ) -> bool {
     let clip = match state.project.clips.get(&clip_id) {
         Some(c) => c,
@@ -204,8 +212,10 @@ fn clip_thumbnail(
     let display_name_str = clip.display_name().to_string();
     let duration = clip.duration;
     let resolution = clip.resolution;
+    let is_audio_only = clip.audio_only;
     let is_starred = state.project.starred.contains(&clip_id);
-    let is_selected = state.ui.selection.selected_clip == Some(clip_id);
+    let is_selected = state.ui.selection.is_clip_selected(clip_id);
+    let is_primary = state.ui.selection.primary_clip() == Some(clip_id);
 
     let meta_height = 16.0;
     let (rect, response) = ui.allocate_exact_size(
@@ -213,7 +223,16 @@ fn clip_thumbnail(
         Sense::click_and_drag(),
     );
 
-    response.dnd_set_drag_payload(clip_id);
+    if is_selected {
+        let payload: Vec<ClipId> = filtered
+            .iter()
+            .copied()
+            .filter(|id| state.ui.selection.is_clip_selected(*id))
+            .collect();
+        response.dnd_set_drag_payload(payload);
+    } else {
+        response.dnd_set_drag_payload(vec![clip_id]);
+    }
 
     let is_hovered = response.hovered();
     let now = ui.input(|i| i.time);
@@ -222,7 +241,7 @@ fn clip_thumbnail(
         state.ui.browser.hover_started_at = Some(now);
     }
 
-    let hover_ready = !is_selected
+    let hover_ready = !is_primary
         && is_hovered
         && state.ui.browser.hover_active_clip == Some(clip_id)
         && state
@@ -231,7 +250,7 @@ fn clip_thumbnail(
             .hover_started_at
             .is_some_and(|started_at| now - started_at >= constants::HOVER_SCRUB_DELAY_SECS);
 
-    if !is_selected && is_hovered && state.ui.browser.hover_active_clip == Some(clip_id) {
+    if !is_primary && is_hovered && state.ui.browser.hover_active_clip == Some(clip_id) {
         if let Some(started_at) = state.ui.browser.hover_started_at {
             let remaining = constants::HOVER_SCRUB_DELAY_SECS - (now - started_at);
             if remaining > 0.0 {
@@ -241,31 +260,86 @@ fn clip_thumbnail(
         }
     }
 
+    let multi_selected_count = state.ui.selection.selected_clips.len();
+    let is_multi = multi_selected_count > 1;
+    let right_clicked_in_multi = is_selected && is_multi;
+
     response.context_menu(|ui| {
-        let star_text = if is_starred { "Unstar" } else { "Star" };
-        if ui.button(star_text).clicked() {
-            state.project.toggle_star(clip_id);
-            ui.close_menu();
-        }
+        if right_clicked_in_multi {
+            let all_starred = state
+                .ui
+                .selection
+                .selected_clips
+                .iter()
+                .all(|id| state.project.starred.contains(id));
+            let star_text = if all_starred {
+                format!("Unstar {} clips", multi_selected_count)
+            } else {
+                format!("Star {} clips", multi_selected_count)
+            };
+            if ui.button(star_text).clicked() {
+                let ids: Vec<ClipId> = state.ui.selection.selected_clips.iter().copied().collect();
+                if all_starred {
+                    for id in ids {
+                        state.project.starred.remove(&id);
+                    }
+                } else {
+                    for id in ids {
+                        state.project.starred.insert(id);
+                    }
+                }
+                ui.close_menu();
+            }
 
-        if ui.button("Rename").clicked() {
-            let current_name = state
-                .project
-                .clips
-                .get(&clip_id)
-                .map(|c| c.display_name().to_string())
-                .unwrap_or_default();
-            state.ui.browser.renaming_clip = Some(clip_id);
-            state.ui.browser.rename_buffer = current_name;
-            ui.close_menu();
-        }
+            ui.separator();
+            ui.label("Tags");
+            for tag in Tag::ALL {
+                let all_have_tag = state
+                    .ui
+                    .selection
+                    .selected_clips
+                    .iter()
+                    .all(|id| (state.project.clip_tag_mask(*id) & tag.bit()) != 0);
+                if ui.selectable_label(all_have_tag, tag.label()).clicked() {
+                    let ids: Vec<ClipId> =
+                        state.ui.selection.selected_clips.iter().copied().collect();
+                    for id in ids {
+                        if all_have_tag {
+                            let entry = state.project.clip_tags.entry(id).or_insert(0);
+                            *entry &= !tag.bit();
+                        } else {
+                            let entry = state.project.clip_tags.entry(id).or_insert(0);
+                            *entry |= tag.bit();
+                        }
+                    }
+                }
+            }
+        } else {
+            let star_text = if is_starred { "Unstar" } else { "Star" };
+            if ui.button(star_text).clicked() {
+                state.project.toggle_star(clip_id);
+                ui.close_menu();
+            }
 
-        ui.separator();
-        ui.label("Tags");
-        for tag in Tag::ALL {
-            let has_tag = (state.project.clip_tag_mask(clip_id) & tag.bit()) != 0;
-            if ui.selectable_label(has_tag, tag.label()).clicked() {
-                state.project.toggle_tag(clip_id, tag);
+            if ui.button("Rename").clicked() {
+                let current_name = state
+                    .project
+                    .clips
+                    .get(&clip_id)
+                    .map(|c| c.display_name().to_string())
+                    .unwrap_or_default();
+                state.ui.browser.renaming_clip = Some(clip_id);
+                state.ui.browser.rename_buffer = current_name;
+                ui.close_menu();
+            }
+
+            ui.separator();
+            ui.label("Tags");
+            for tag in Tag::ALL {
+                let has_tag = (state.project.clip_tag_mask(clip_id) & tag.bit()) != 0;
+                if ui.selectable_label(has_tag, tag.label()).clicked() {
+                    state.project.toggle_tag(clip_id, tag);
+                }
             }
         }
     });
@@ -288,9 +362,16 @@ fn clip_thumbnail(
             None
         };
 
-        let was_selected = is_selected;
-        if response.clicked() && !was_selected {
-            state.ui.selection.selected_clip = Some(clip_id);
+        if response.clicked() {
+            let modifiers = ui.input(|i| i.modifiers);
+            if modifiers.command {
+                state.ui.selection.toggle_clip(clip_id);
+            } else if modifiers.shift {
+                let anchor = state.ui.selection.last_selected_clip;
+                state.ui.selection.select_range(anchor, clip_id, filtered);
+            } else {
+                state.ui.selection.select_single(clip_id);
+            }
 
             let click_t = response
                 .interact_pointer_pos()
@@ -298,15 +379,16 @@ fn clip_thumbnail(
             state.ui.selection.selected_scrub_t = hover_t.or(click_t);
         }
 
-        let is_selected = state.ui.selection.selected_clip == Some(clip_id);
-        let hover_ready = hover_ready && !is_selected;
+        let is_selected = state.ui.selection.is_clip_selected(clip_id);
+        let is_primary = state.ui.selection.primary_clip() == Some(clip_id);
+        let hover_ready = hover_ready && !is_primary;
 
         if hover_ready {
             state.ui.selection.hovered_clip = Some(clip_id);
             state.ui.browser.hovered_scrub_t = hover_t;
         }
 
-        let selected_t = if is_selected {
+        let selected_t = if is_primary {
             state.ui.selection.selected_scrub_t
         } else {
             None
@@ -315,7 +397,7 @@ fn clip_thumbnail(
         let scrub_info = if let Some(frames) = preview_frames {
             if frames.is_empty() {
                 None
-            } else if is_selected {
+            } else if is_primary {
                 selected_t.map(|t| {
                     let t = t.clamp(0.0, 1.0);
                     let idx = ((t * frames.len() as f32) as usize).min(frames.len() - 1);
@@ -351,6 +433,23 @@ fn clip_thumbnail(
             egui::Spinner::new()
                 .size(spinner_size)
                 .paint_at(ui, spinner_rect);
+        } else if is_audio_only {
+            ui.painter()
+                .rect_filled(thumb_rect, theme::ROUNDING, theme::BG_SURFACE);
+            ui.painter().text(
+                thumb_rect.center() - vec2(0.0, 8.0),
+                egui::Align2::CENTER_CENTER,
+                "\u{266B}",
+                egui::FontId::proportional(24.0),
+                theme::ACCENT,
+            );
+            ui.painter().text(
+                thumb_rect.center() + vec2(0.0, 14.0),
+                egui::Align2::CENTER_CENTER,
+                "Audio",
+                egui::FontId::proportional(10.0),
+                theme::TEXT_DIM,
+            );
         } else {
             ui.painter()
                 .rect_filled(thumb_rect, theme::ROUNDING, theme::BG_SURFACE);
@@ -363,7 +462,7 @@ fn clip_thumbnail(
             );
         }
 
-        if is_selected {
+        if is_primary {
             let bar_height = 3.0;
             let bar_track_rect = Rect::from_min_size(
                 egui::pos2(thumb_rect.left(), thumb_rect.bottom() - bar_height),

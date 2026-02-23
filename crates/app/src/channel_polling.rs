@@ -28,7 +28,11 @@ impl EditorApp {
                 clip.duration = meta.duration;
                 clip.resolution = meta.resolution;
                 clip.codec = meta.codec;
+                clip.audio_only = !meta.has_video;
                 clip.rebuild_search_haystack(tag_mask);
+                if !meta.has_video {
+                    self.textures.pending_thumbnails.remove(&id);
+                }
             }
             received = true;
         }
@@ -74,6 +78,8 @@ impl EditorApp {
             .map(|f| f.frame_delivered)
             .unwrap_or(false);
         let fwd_started_at = self.forward.as_ref().map(|f| f.started_at);
+        let rev_last_frame_time = self.reverse.as_ref().and_then(|r| r.last_frame_time);
+        let rev_started_at = self.reverse.as_ref().map(|r| r.started_at);
 
         while let Ok(result) = self.video_decode.result_rx.try_recv() {
             let forward_frame_age = fwd_last_frame_time
@@ -93,12 +99,17 @@ impl EditorApp {
                 && (forward_frame_gap_long_stall
                     || (!fwd_frame_delivered
                         && forward_startup_age > FORWARD_STARTUP_LONG_GRACE_S));
+            let reverse_startup_age = rev_started_at.map(|t| now - t).unwrap_or(f64::INFINITY);
             let reverse_pipeline_stalled = self.reverse.is_some()
                 && self.state.project.playback.state == PlaybackState::PlayingReverse
-                && fwd_last_frame_time.is_none_or(|t| (now - t) > FRAME_GAP_STALL_S);
+                && (rev_last_frame_time.is_some_and(|t| (now - t) > FRAME_GAP_STALL_S)
+                    || (rev_last_frame_time.is_none()
+                        && reverse_startup_age > FORWARD_STARTUP_GRACE_S));
             let reverse_long_stall = self.reverse.is_some()
                 && self.state.project.playback.state == PlaybackState::PlayingReverse
-                && fwd_last_frame_time.is_none_or(|t| (now - t) > FRAME_GAP_LONG_STALL_S);
+                && (rev_last_frame_time.is_some_and(|t| (now - t) > FRAME_GAP_LONG_STALL_S)
+                    || (rev_last_frame_time.is_none()
+                        && reverse_startup_age > FORWARD_STARTUP_LONG_GRACE_S));
             let current_source = self.last_decoded_frame.map(|(_, s)| s);
             let should_apply_fallback_texture = (self.state.project.playback.state
                 == PlaybackState::Playing
@@ -114,6 +125,13 @@ impl EditorApp {
                 && self.state.project.playback.state == PlaybackState::Playing
                 && !fwd_frame_delivered
                 && forward_startup_age <= FORWARD_STARTUP_GRACE_S
+            {
+                continue;
+            }
+            if self.reverse.is_some()
+                && self.state.project.playback.state == PlaybackState::PlayingReverse
+                && rev_last_frame_time.is_none()
+                && reverse_startup_age <= FORWARD_STARTUP_GRACE_S
             {
                 continue;
             }
@@ -177,6 +195,8 @@ impl EditorApp {
                 wizard_audio::output::enqueue_samples(&mut producer, &snippet.samples_mono, ch);
             }
         }
+
+        self.mixer.mix_tick();
 
         if received {
             ctx.request_repaint();

@@ -15,6 +15,29 @@ use crate::decoder::{fit_dimensions, init_once};
 
 pub type AudioProducer = ringbuf::HeapProd<f32>;
 
+fn append_debug_log(location: &str, message: &str, hypothesis_id: &str, data_json: String) {
+    use std::fs::OpenOptions;
+    use std::io::Write;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let id = format!("log_{timestamp}_{hypothesis_id}");
+    if let Ok(mut file) = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/Users/irashid/personal/wizard-editor/.cursor/debug.log")
+    {
+        let _ = writeln!(
+            file,
+            "{{\"id\":\"{}\",\"timestamp\":{},\"location\":\"{}\",\"message\":\"{}\",\"data\":{},\"runId\":\"audio-resampler-debug\",\"hypothesisId\":\"{}\"}}",
+            id, timestamp, location, message, data_json, hypothesis_id
+        );
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct DecodedFrame {
     pub pts_seconds: f64,
@@ -473,7 +496,8 @@ pub struct ReversePipelineHandle {
     frame_rx: mpsc::Receiver<DecodedFrame>,
     stop_tx: Option<mpsc::Sender<()>>,
     speed_tx: mpsc::Sender<f64>,
-    _worker: Option<JoinHandle<()>>,
+    _decode_handle: Option<JoinHandle<()>>,
+    _pacer_handle: Option<JoinHandle<()>>,
 }
 
 impl ReversePipelineHandle {
@@ -489,59 +513,38 @@ impl ReversePipelineHandle {
         let path_owned = path.to_path_buf();
         let (stop_tx, stop_rx) = mpsc::channel::<()>();
         let (speed_tx, speed_rx) = mpsc::channel::<f64>();
+        let (intermediate_tx, intermediate_rx) = mpsc::sync_channel::<DecodedFrame>(8);
         let (frame_tx, frame_rx) = mpsc::sync_channel::<DecodedFrame>(4);
 
-        let worker = std::thread::Builder::new()
-            .name("reverse-pipeline".into())
+        let decode_handle = std::thread::Builder::new()
+            .name("reverse-decode".into())
             .spawn(move || {
                 let Ok(mut decoder) = crate::decoder::VideoDecoder::open(&path_owned) else {
                     return;
                 };
 
-                let format_ctx = ffmpeg::format::input(&path_owned).ok();
-                let fps = format_ctx
-                    .and_then(|ctx| {
-                        ctx.streams().best(Type::Video).map(|s| {
-                            let r = s.avg_frame_rate();
-                            if r.denominator() > 0 {
-                                r.numerator() as f64 / r.denominator() as f64
-                            } else {
-                                24.0
-                            }
-                        })
-                    })
-                    .unwrap_or(24.0);
-
                 let mut current_end = start_time;
-                let mut current_speed = speed;
 
-                'outer: while current_end > 0.0 {
+                while current_end > 0.0 {
+                    if let Ok(_) | Err(mpsc::TryRecvError::Disconnected) = stop_rx.try_recv() {
+                        return;
+                    }
+
                     let gop_start = (current_end - GOP_WINDOW).max(0.0);
                     let mut frames =
                         decoder.decode_gop_range(gop_start, current_end, target_w, target_h);
                     frames.reverse();
 
-                    let base_interval = 1.0 / fps;
-
-                    for (pts, rgba_data, w, h) in frames.iter() {
+                    for (pts, rgba_data, w, h) in frames {
                         if let Ok(_) | Err(mpsc::TryRecvError::Disconnected) = stop_rx.try_recv() {
                             return;
                         }
-                        while let Ok(s) = speed_rx.try_recv() {
-                            current_speed = s;
-                        }
-
-                        let sleep_dur = base_interval / current_speed;
-                        if sleep_dur > 0.001 {
-                            std::thread::sleep(std::time::Duration::from_secs_f64(sleep_dur));
-                        }
-
-                        if frame_tx
+                        if intermediate_tx
                             .send(DecodedFrame {
-                                pts_seconds: *pts,
-                                width: *w,
-                                height: *h,
-                                rgba_data: rgba_data.clone(),
+                                pts_seconds: pts,
+                                width: w,
+                                height: h,
+                                rgba_data,
                             })
                             .is_err()
                         {
@@ -551,17 +554,56 @@ impl ReversePipelineHandle {
 
                     current_end = gop_start;
                     if gop_start <= 0.0 {
-                        break 'outer;
+                        break;
                     }
                 }
             })
-            .map_err(|e| format!("Failed to spawn reverse pipeline: {e}"))?;
+            .map_err(|e| format!("Failed to spawn reverse decode thread: {e}"))?;
+
+        let initial_speed = speed;
+        let pacer_handle = std::thread::Builder::new()
+            .name("reverse-pacer".into())
+            .spawn(move || {
+                let mut clock = StreamClock::new(initial_speed);
+                let mut last_pts: Option<f64> = None;
+                let mut gop_base_pts: f64 = 0.0;
+
+                while let Ok(frame) = intermediate_rx.recv() {
+                    while let Ok(s) = speed_rx.try_recv() {
+                        clock.set_speed(s);
+                    }
+
+                    let is_gop_boundary = match last_pts {
+                        Some(prev) => frame.pts_seconds > prev + 0.001,
+                        None => true,
+                    };
+
+                    if is_gop_boundary {
+                        clock.reset(0.0);
+                        gop_base_pts = frame.pts_seconds;
+                    }
+
+                    let distance = (gop_base_pts - frame.pts_seconds).abs();
+                    let delay = clock.delay(distance);
+                    if !delay.is_zero() {
+                        std::thread::sleep(delay);
+                    }
+
+                    last_pts = Some(frame.pts_seconds);
+
+                    if frame_tx.send(frame).is_err() {
+                        return;
+                    }
+                }
+            })
+            .map_err(|e| format!("Failed to spawn reverse pacer thread: {e}"))?;
 
         Ok(Self {
             frame_rx,
             stop_tx: Some(stop_tx),
             speed_tx,
-            _worker: Some(worker),
+            _decode_handle: Some(decode_handle),
+            _pacer_handle: Some(pacer_handle),
         })
     }
 
@@ -600,6 +642,17 @@ fn spawn_audio_decoder(
     std::thread::Builder::new()
         .name("pipeline-audio".into())
         .spawn(move || {
+            // #region agent log
+            append_debug_log(
+                "crates/media/src/pipeline.rs:spawn_audio_decoder",
+                "audio decoder thread start",
+                "H5",
+                format!(
+                    "{{\"skipBefore\":{},\"timeBase\":{},\"outputSampleRate\":{},\"outputChannels\":{},\"speed\":{}}}",
+                    skip_before, time_base, output_sample_rate, output_channels, speed
+                ),
+            );
+            // #endregion
             let Ok(format_ctx) = ffmpeg::format::input(&path) else {
                 return;
             };
@@ -617,24 +670,107 @@ fn spawn_audio_decoder(
             };
 
             let src_format = decoder.format();
-            let src_channel_layout = decoder.ch_layout();
             let src_rate = decoder.rate();
+            let (src_channels, src_mask) = {
+                let src_channel_layout = decoder.ch_layout();
+                (src_channel_layout.channels(), src_channel_layout.mask())
+            };
+            let src_layout_for_resampler = match src_mask.and_then(ffmpeg::ChannelLayout::from_mask)
+            {
+                Some(layout) => layout,
+                None => {
+                    let fallback = ffmpeg::ChannelLayout::default_for_channels(src_channels);
+                    // #region agent log
+                    append_debug_log(
+                        "crates/media/src/pipeline.rs:audio_decoder_layout_fallback",
+                        "using default channel layout for UNSPEC source layout",
+                        "H1",
+                        format!(
+                            "{{\"srcChannels\":{},\"fallbackMaskIsSome\":{}}}",
+                            src_channels,
+                            fallback.mask().is_some()
+                        ),
+                    );
+                    // #endregion
+                    fallback
+                }
+            };
 
             let dst_format = ffmpeg::format::Sample::F32(ffmpeg::format::sample::Type::Packed);
             let dst_rate = output_sample_rate;
+            let dst_layout = ffmpeg::ChannelLayout::MONO;
 
-            let resampler = ffmpeg::software::resampling::Context::get2(
-                src_format,
-                src_channel_layout,
-                src_rate,
-                dst_format,
-                ffmpeg::ChannelLayout::MONO,
-                dst_rate,
+            // #region agent log
+            append_debug_log(
+                "crates/media/src/pipeline.rs:audio_decoder_source_layout",
+                "decoder source params before resampler",
+                "H1",
+                format!(
+                    "{{\"srcRate\":{},\"srcChannels\":{},\"srcMaskIsSome\":{},\"srcMask\":{},\"dstRate\":{},\"dstMaskIsSome\":{}}}",
+                    src_rate,
+                    src_channels,
+                    src_mask.is_some(),
+                    src_mask.map(|m| m.bits()).unwrap_or(0),
+                    dst_rate,
+                    dst_layout.mask().is_some()
+                ),
             );
+            // #endregion
+
+            let resampler = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                ffmpeg::software::resampling::Context::get2(
+                    src_format,
+                    src_layout_for_resampler.clone(),
+                    src_rate,
+                    dst_format,
+                    dst_layout,
+                    dst_rate,
+                )
+            }));
+            let resampler = match resampler {
+                Ok(r) => r,
+                Err(_) => {
+                    // #region agent log
+                    append_debug_log(
+                        "crates/media/src/pipeline.rs:audio_resampler_catch_unwind",
+                        "resampler constructor panicked",
+                        "H3",
+                        format!(
+                            "{{\"srcMaskIsSome\":{},\"srcRate\":{},\"srcChannels\":{}}}",
+                            src_mask.is_some(),
+                            src_rate,
+                            src_channels
+                        ),
+                    );
+                    // #endregion
+                    return;
+                }
+            };
 
             let muted = speed < 0.99;
+            // #region agent log
+            append_debug_log(
+                "crates/media/src/pipeline.rs:audio_muted_branch",
+                "audio muted branch decision",
+                "H5",
+                format!("{{\"muted\":{},\"speed\":{}}}", muted, speed),
+            );
+            // #endregion
 
             let Ok(mut resampler) = resampler else {
+                // #region agent log
+                append_debug_log(
+                    "crates/media/src/pipeline.rs:audio_resampler_err",
+                    "resampler returned error, entering fallback",
+                    "H4",
+                    format!(
+                        "{{\"srcRate\":{},\"srcChannels\":{},\"srcMaskIsSome\":{}}}",
+                        src_rate,
+                        src_channels,
+                        src_mask.is_some()
+                    ),
+                );
+                // #endregion
                 if muted {
                     loop {
                         if packet_rx.recv().is_err() {
@@ -667,6 +803,10 @@ fn spawn_audio_decoder(
             let mut clock = StreamClock::new(speed);
             let mut skipping = skip_before > 0.01;
             let mut estimated_next_pts: Option<f64> = None;
+            let mut logged_decode_frame = false;
+            let mut logged_resample_outcome = false;
+            let mut logged_ringbuf_pressure = false;
+            let mut logged_frame_layout_patch = false;
 
             loop {
                 let Ok(packet) = packet_rx.recv() else {
@@ -686,6 +826,24 @@ fn spawn_audio_decoder(
                 }
 
                 while decoder.receive_frame(&mut decoded).is_ok() {
+                    if !logged_decode_frame {
+                        // #region agent log
+                        append_debug_log(
+                            "crates/media/src/pipeline.rs:audio_decoded_frame",
+                            "first decoded frame in audio loop",
+                            "H6",
+                            format!(
+                                "{{\"decodedSamples\":{},\"decodedRate\":{},\"decodedChannels\":{},\"decodedFormat\":\"{:?}\",\"decodedPacked\":{}}}",
+                                decoded.samples(),
+                                decoder.rate(),
+                                decoded.ch_layout().channels(),
+                                decoded.format(),
+                                decoded.is_packed()
+                            ),
+                        );
+                        // #endregion
+                        logged_decode_frame = true;
+                    }
                     let frame_pts = decoded
                         .pts()
                         .map(|p| p as f64 * time_base)
@@ -711,8 +869,61 @@ fn spawn_audio_decoder(
                         std::thread::sleep(delay);
                     }
 
-                    let _ = resampler.run(&decoded, &mut resampled);
-                    push_resampled_f32(&resampled, &audio_producer, output_channels);
+                    if decoded.ch_layout().mask().is_none() {
+                        decoded.set_ch_layout(src_layout_for_resampler.clone());
+                        if !logged_frame_layout_patch {
+                            // #region agent log
+                            append_debug_log(
+                                "crates/media/src/pipeline.rs:audio_frame_layout_patch",
+                                "patched decoded frame layout from UNSPEC before resampling",
+                                "H9",
+                                format!(
+                                    "{{\"patchedChannels\":{},\"patchedMaskIsSome\":{}}}",
+                                    decoded.ch_layout().channels(),
+                                    decoded.ch_layout().mask().is_some()
+                                ),
+                            );
+                            // #endregion
+                            logged_frame_layout_patch = true;
+                        }
+                    }
+
+                    let run_result = resampler.run(&decoded, &mut resampled);
+                    if !logged_resample_outcome {
+                        // #region agent log
+                        append_debug_log(
+                            "crates/media/src/pipeline.rs:audio_resample_run",
+                            "first resampler run outcome",
+                            "H7",
+                            format!(
+                                "{{\"runOk\":{},\"runErr\":\"{:?}\",\"resampledSamples\":{},\"resampledFormat\":\"{:?}\",\"resampledPacked\":{}}}",
+                                run_result.is_ok(),
+                                run_result.as_ref().err(),
+                                resampled.samples(),
+                                resampled.format(),
+                                resampled.is_packed()
+                            ),
+                        );
+                        // #endregion
+                        logged_resample_outcome = true;
+                    }
+                    let pushed = push_resampled_f32(&resampled, &audio_producer, output_channels);
+                    if !logged_ringbuf_pressure && pushed == 0 && resampled.samples() > 0 {
+                        // #region agent log
+                        append_debug_log(
+                            "crates/media/src/pipeline.rs:audio_ringbuf_push",
+                            "resampled buffer had samples but push wrote zero",
+                            "H8",
+                            format!(
+                                "{{\"resampledSamples\":{},\"outputChannels\":{},\"pushed\":{}}}",
+                                resampled.samples(),
+                                output_channels,
+                                pushed
+                            ),
+                        );
+                        // #endregion
+                        logged_ringbuf_pressure = true;
+                    }
                 }
             }
         })
@@ -828,10 +1039,10 @@ fn push_resampled_f32(
     frame: &ffmpeg::util::frame::Audio,
     producer: &Arc<Mutex<AudioProducer>>,
     output_channels: u16,
-) {
+) -> usize {
     let samples = frame.samples();
     if samples == 0 {
-        return;
+        return 0;
     }
 
     let data = frame.data(0);
@@ -855,8 +1066,9 @@ fn push_resampled_f32(
     }
 
     if let Ok(mut guard) = producer.lock() {
-        let _ = guard.push_slice(&buf);
+        return guard.push_slice(&buf);
     }
+    0
 }
 
 fn push_audio_samples_manual(
