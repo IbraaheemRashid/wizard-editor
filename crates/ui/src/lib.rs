@@ -14,4 +14,5 @@ pub trait TextureLookup {
     fn is_preview_loading(&self, id: &ClipId) -> bool;
     fn waveform_peaks(&self, id: &ClipId) -> Option<&Vec<(f32, f32)>>;
     fn playback_frame(&self) -> Option<&egui::TextureHandle>;
+    fn scrub_frame_at_time(&self, id: &ClipId, source_time: f64) -> Option<&egui::TextureHandle>;
 }

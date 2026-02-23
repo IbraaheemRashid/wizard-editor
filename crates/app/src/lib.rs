@@ -24,6 +24,7 @@ use pipeline::{ForwardPipelineState, ReversePipelineState, ShadowPipelineState};
 use texture_cache::TextureCache;
 use workers::audio_worker::AudioWorkerChannels;
 use workers::preview_worker::PreviewWorkerChannels;
+use workers::scrub_cache_worker::ScrubCacheWorkerChannels;
 use workers::video_decode_worker::VideoDecodeWorkerChannels;
 
 use crate::constants::*;
@@ -49,6 +50,7 @@ pub struct EditorApp {
     waveform_tx: mpsc::Sender<(ClipId, Vec<(f32, f32)>)>,
     waveform_rx: mpsc::Receiver<(ClipId, Vec<(f32, f32)>)>,
     video_decode: VideoDecodeWorkerChannels,
+    scrub_cache: ScrubCacheWorkerChannels,
     forward: Option<ForwardPipelineState>,
     shadow: Option<ShadowPipelineState>,
     reverse: Option<ReversePipelineState>,
@@ -89,6 +91,7 @@ impl EditorApp {
 
         let preview = workers::preview_worker::spawn_preview_worker();
         let video_decode = workers::video_decode_worker::spawn_video_decode_worker();
+        let scrub_cache = workers::scrub_cache_worker::spawn_scrub_cache_worker();
 
         let (audio_output, audio_producer, audio_sample_rate, audio_channels) =
             match AudioOutput::new() {
@@ -132,6 +135,7 @@ impl EditorApp {
             waveform_tx,
             waveform_rx,
             video_decode,
+            scrub_cache,
             forward: None,
             shadow: None,
             reverse: None,
@@ -242,6 +246,7 @@ impl eframe::App for EditorApp {
         }
 
         self.enqueue_visible_previews();
+        self.enqueue_scrub_cache_for_timeline_clips();
         self.update_hover_audio();
         self.update_timeline_scrub_audio();
         self.update_playback_frame(now);

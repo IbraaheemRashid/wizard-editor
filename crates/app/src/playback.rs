@@ -1,8 +1,11 @@
 use wizard_state::playback::PlaybackState;
 
 use crate::constants::*;
+use std::collections::HashSet;
+
 use crate::workers::audio_worker::AudioPreviewRequest;
 use crate::workers::preview_worker::PreviewRequest;
+use crate::workers::scrub_cache_worker::ScrubCacheRequest;
 use crate::workers::video_decode_worker::{
     VideoDecodeRequest, PLAYBACK_DECODE_HEIGHT, PLAYBACK_DECODE_WIDTH,
 };
@@ -198,6 +201,48 @@ impl EditorApp {
         });
     }
 
+    pub fn enqueue_scrub_cache_for_timeline_clips(&mut self) {
+        let mut on_timeline: HashSet<wizard_state::clip::ClipId> = HashSet::new();
+        for track in &self.state.project.timeline.video_tracks {
+            for clip in &track.clips {
+                on_timeline.insert(clip.source_id);
+            }
+        }
+
+        for &source_id in &on_timeline {
+            if self.textures.scrub_frames.contains_key(&source_id) {
+                continue;
+            }
+            if self.textures.scrub_requested.contains(&source_id) {
+                continue;
+            }
+            let Some(clip) = self.state.project.clips.get(&source_id) else {
+                continue;
+            };
+            if clip.audio_only {
+                continue;
+            }
+            self.textures.scrub_requested.insert(source_id);
+            let _ = self.scrub_cache.req_tx.send(ScrubCacheRequest::Extract {
+                clip_id: source_id,
+                path: clip.path.clone(),
+            });
+        }
+
+        let stale: Vec<wizard_state::clip::ClipId> = self
+            .textures
+            .scrub_frames
+            .keys()
+            .filter(|id| !on_timeline.contains(id))
+            .copied()
+            .collect();
+        for id in stale {
+            self.textures.scrub_frames.remove(&id);
+            self.textures.scrub_requested.remove(&id);
+            let _ = self.scrub_cache.req_tx.send(ScrubCacheRequest::Invalidate { clip_id: id });
+        }
+    }
+
     pub fn update_playback_frame(&mut self, now: f64) {
         let last_frame_time = self.last_pipeline_frame_time();
         let fwd_started_at = self.forward.as_ref().map(|f| f.started_at);
@@ -254,6 +299,13 @@ impl EditorApp {
         };
 
         if let Some(hit) = self.state.project.timeline.video_clip_at_time(time) {
+            if is_scrubbing {
+                if let Some(tex) = self.textures.scrub_frames.get(&hit.clip.source_id).and_then(|entry| entry.frame_at_time(hit.source_time)) {
+                    self.textures.playback_texture = Some(tex.clone());
+                    return;
+                }
+            }
+
             if let Some(clip) = self.state.project.clips.get(&hit.clip.source_id) {
                 let bucket = (hit.source_time * VIDEO_DECODE_BUCKET_RATE).round() as i64;
                 if self.last_video_decode_request == Some((hit.clip.source_id, bucket)) {

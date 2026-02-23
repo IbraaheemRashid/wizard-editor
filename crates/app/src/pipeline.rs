@@ -217,6 +217,7 @@ impl EditorApp {
             fwd.frame_delivered = true;
             fwd.last_frame_time = Some(now);
         } else {
+            self.show_scrub_cache_bridge_frame(next_hit.clip.source_id, next_hit.source_time);
             let _ = self.video_decode.req_tx.send(VideoDecodeRequest {
                 clip_id: next_hit.clip.source_id,
                 path: fwd.clip.1.clone(),
@@ -421,6 +422,7 @@ impl EditorApp {
                         started_at: now,
                         last_frame_time: None,
                     });
+                    self.show_scrub_cache_bridge_frame(clip_id, source_time);
                 }
                 Err(e) => {
                     eprintln!("Failed to start reverse pipeline: {e}");
@@ -466,6 +468,7 @@ impl EditorApp {
                     last_frame_time: None,
                     age: 0,
                 });
+                self.show_scrub_cache_bridge_frame(clip_id, source_time);
                 let _ = self.video_decode.req_tx.send(VideoDecodeRequest {
                     clip_id,
                     path: path.to_path_buf(),
@@ -683,6 +686,10 @@ impl EditorApp {
                                         started_at: now,
                                         last_frame_time: None,
                                     });
+                                    self.show_scrub_cache_bridge_frame(
+                                        prev_clip_id,
+                                        prev_hit.source_time,
+                                    );
                                 }
                             }
                         }
@@ -694,6 +701,17 @@ impl EditorApp {
 
         self.update_video_fps(now);
         true
+    }
+
+    fn show_scrub_cache_bridge_frame(&mut self, source_id: ClipId, source_time: f64) {
+        if let Some(tex) = self
+            .textures
+            .scrub_frames
+            .get(&source_id)
+            .and_then(|entry| entry.frame_at_time(source_time))
+        {
+            self.textures.playback_texture = Some(tex.clone());
+        }
     }
 
     pub fn find_timeline_hit_for_source_pts(&self, pts: f64) -> Option<f64> {

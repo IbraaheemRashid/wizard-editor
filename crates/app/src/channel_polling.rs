@@ -66,6 +66,39 @@ impl EditorApp {
             received = true;
         }
 
+        while let Ok(sf) = self.scrub_cache.result_rx.try_recv() {
+            let texture = ctx.load_texture(
+                format!("scrub_{:?}_{}", sf.clip_id, sf.index),
+                egui::ColorImage::from_rgba_unmultiplied(
+                    [sf.image.width() as usize, sf.image.height() as usize],
+                    sf.image.as_raw(),
+                ),
+                egui::TextureOptions::LINEAR,
+            );
+            let entry = self
+                .textures
+                .scrub_frames
+                .entry(sf.clip_id)
+                .or_insert_with(|| crate::texture_cache::ScrubCacheEntry {
+                    frames: Vec::with_capacity(sf.total),
+                    pts: Vec::with_capacity(sf.total),
+                });
+            if entry.frames.len() <= sf.index {
+                let needed = sf.index + 1 - entry.frames.len();
+                for _ in 0..needed {
+                    entry.frames.push(ctx.load_texture(
+                        "scrub_placeholder",
+                        egui::ColorImage::new([1, 1], egui::Color32::TRANSPARENT),
+                        Default::default(),
+                    ));
+                    entry.pts.push(0.0);
+                }
+            }
+            entry.frames[sf.index] = texture;
+            entry.pts[sf.index] = sf.pts_seconds;
+            received = true;
+        }
+
         while let Ok((id, peaks)) = self.waveform_rx.try_recv() {
             self.textures.waveform_peaks.insert(id, peaks);
             received = true;
@@ -199,12 +232,18 @@ impl EditorApp {
             last_snippet = Some(snippet);
         }
         if let Some(snippet) = last_snippet {
-            if !self.is_playing() {
+            if self.is_playing() {
+                // drop snippet — don't let hover/scrub previews interfere with playback audio
+            } else {
                 self.reset_audio_sources();
-            }
-            if let Ok(mut producer) = self.audio_producer.lock() {
-                let ch = self.audio_channels;
-                wizard_audio::output::enqueue_samples(&mut producer, &snippet.samples_mono, ch);
+                if let Ok(mut producer) = self.audio_producer.lock() {
+                    let ch = self.audio_channels;
+                    wizard_audio::output::enqueue_samples(
+                        &mut producer,
+                        &snippet.samples_mono,
+                        ch,
+                    );
+                }
             }
         }
 

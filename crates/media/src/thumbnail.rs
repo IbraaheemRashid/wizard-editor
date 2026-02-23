@@ -46,10 +46,12 @@ pub fn extract_thumbnail(path: &Path) -> Option<image::RgbaImage> {
     decoder.seek_and_decode(1.0, THUMB_WIDTH, THUMB_HEIGHT)
 }
 
-pub fn extract_preview_frames_streaming(
+pub fn extract_frames_streaming(
     path: &Path,
     count: usize,
-    sender: &std::sync::mpsc::Sender<(usize, image::RgbaImage)>,
+    width: u32,
+    height: u32,
+    sender: &std::sync::mpsc::Sender<(usize, f64, image::RgbaImage)>,
 ) {
     let mut decoder = match VideoDecoder::open(path) {
         Ok(d) => d,
@@ -74,23 +76,37 @@ pub fn extract_preview_frames_streaming(
             break;
         }
 
-        let Some((img, pts)) = decoder.decode_next_frame_with_pts(PREVIEW_WIDTH, PREVIEW_HEIGHT)
-        else {
+        let Some((img, pts)) = decoder.decode_next_frame_with_pts(width, height) else {
             break;
         };
 
         if pts + 0.001 >= targets[next_idx] {
-            if sender.send((next_idx, img.clone())).is_err() {
+            if sender.send((next_idx, pts, img.clone())).is_err() {
                 return;
             }
             next_idx += 1;
 
             while next_idx < actual_count && pts + 0.001 >= targets[next_idx] {
-                if sender.send((next_idx, img.clone())).is_err() {
+                if sender.send((next_idx, pts, img.clone())).is_err() {
                     return;
                 }
                 next_idx += 1;
             }
+        }
+    }
+}
+
+pub fn extract_preview_frames_streaming(
+    path: &Path,
+    count: usize,
+    sender: &std::sync::mpsc::Sender<(usize, image::RgbaImage)>,
+) {
+    let (pts_tx, pts_rx) = std::sync::mpsc::channel();
+    extract_frames_streaming(path, count, PREVIEW_WIDTH, PREVIEW_HEIGHT, &pts_tx);
+    drop(pts_tx);
+    while let Ok((index, _pts, image)) = pts_rx.recv() {
+        if sender.send((index, image)).is_err() {
+            return;
         }
     }
 }
