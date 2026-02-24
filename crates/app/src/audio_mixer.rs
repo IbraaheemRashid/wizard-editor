@@ -3,11 +3,11 @@ use std::sync::{Arc, Mutex};
 use ringbuf::traits::{Consumer, Observer, Producer, Split};
 use ringbuf::HeapRb;
 use wizard_audio::output::{AudioConsumer, AudioProducer};
-use wizard_media::pipeline::AudioOnlyHandle;
+use wizard_media::gst_pipeline::GstAudioOnlyHandle;
 
 struct AudioSource {
     consumer: AudioConsumer,
-    _handle: AudioOnlyHandle,
+    _handle: GstAudioOnlyHandle,
 }
 
 pub struct AudioMixer {
@@ -18,8 +18,6 @@ pub struct AudioMixer {
 
 const SOURCE_RING_SIZE: usize = 65536;
 const MIX_BUF_MAX: usize = 4096;
-static LAST_MIXER_UNDERFLOW_LOG_MS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
 
 impl AudioMixer {
     pub fn new(output: Arc<Mutex<AudioProducer>>) -> Self {
@@ -35,7 +33,7 @@ impl AudioMixer {
         rb.split()
     }
 
-    pub fn add_source(&mut self, handle: AudioOnlyHandle, consumer: AudioConsumer) {
+    pub fn add_source(&mut self, handle: GstAudioOnlyHandle, consumer: AudioConsumer) {
         self.sources.push(AudioSource {
             consumer,
             _handle: handle,
@@ -55,25 +53,6 @@ impl AudioMixer {
             .unwrap_or(0);
 
         if max_available == 0 {
-            let now_ms = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis() as u64)
-                .unwrap_or(0);
-            let last = LAST_MIXER_UNDERFLOW_LOG_MS.load(std::sync::atomic::Ordering::Relaxed);
-            if now_ms.saturating_sub(last) > 500 {
-                LAST_MIXER_UNDERFLOW_LOG_MS.store(now_ms, std::sync::atomic::Ordering::Relaxed);
-                // #region agent log
-                crate::debug_log::emit(
-                    "H4",
-                    "crates/app/src/audio_mixer.rs:mix_tick",
-                    "audio mixer underflow detected",
-                    serde_json::json!({
-                        "sourceCount": self.sources.len(),
-                        "maxAvailableSamples": max_available
-                    }),
-                );
-                // #endregion
-            }
             return;
         }
 
@@ -107,7 +86,7 @@ impl AudioMixer {
         self.sources.clear();
     }
 
-    pub fn replace_sources(&mut self, new_sources: Vec<(AudioOnlyHandle, AudioConsumer)>) {
+    pub fn replace_sources(&mut self, new_sources: Vec<(GstAudioOnlyHandle, AudioConsumer)>) {
         self.sources.clear();
         for (handle, consumer) in new_sources {
             self.sources.push(AudioSource {

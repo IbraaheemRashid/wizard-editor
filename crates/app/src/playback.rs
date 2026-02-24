@@ -74,6 +74,7 @@ impl EditorApp {
                 continue;
             }
             self.textures.scrub_requested.insert(source_id);
+            wizard_media::gst_pipeline::prewarm_file(&clip.path);
             let _ = self.scrub_cache.req_tx.send(ScrubCacheRequest::Extract {
                 clip_id: source_id,
                 path: clip.path.clone(),

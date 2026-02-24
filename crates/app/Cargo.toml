@@ -13,4 +13,3 @@ egui = { workspace = true }
 image = { workspace = true }
 notify = { workspace = true }
 ringbuf = { workspace = true }
-serde_json = { workspace = true }

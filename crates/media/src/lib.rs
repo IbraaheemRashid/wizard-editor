@@ -1,5 +1,6 @@
 pub mod audio;
 pub mod decoder;
+pub mod gst_pipeline;
 pub mod import;
 pub mod metadata;
 pub mod pipeline;

@@ -1,66 +1,30 @@
 use crate::EditorApp;
+use std::time::Instant;
 
 impl EditorApp {
     pub fn poll_import_tasks(&mut self, ctx: &egui::Context) {
         let mut received = false;
+        let is_playing = matches!(
+            self.state.project.playback.state,
+            wizard_state::playback::PlaybackState::Playing
+                | wizard_state::playback::PlaybackState::PlayingReverse
+        );
+        let is_scrubbing = self.state.ui.timeline.scrubbing.is_some();
+        let budget_ms = if is_scrubbing {
+            8.0
+        } else if is_playing {
+            4.0
+        } else {
+            f64::INFINITY
+        };
+        let t0 = Instant::now();
+        let within_budget = || t0.elapsed().as_secs_f64() * 1000.0 < budget_ms;
 
-        while let Ok((id, img)) = self.thumb_rx.try_recv() {
-            let texture = ctx.load_texture(
-                format!("thumb_{:?}", id),
-                egui::ColorImage::from_rgba_unmultiplied(
-                    [img.width() as usize, img.height() as usize],
-                    img.as_raw(),
-                ),
-                egui::TextureOptions::LINEAR,
-            );
-            self.textures.thumbnails.insert(id, texture);
-            self.textures.pending_thumbnails.remove(&id);
-            received = true;
-        }
-
-        while let Ok((id, meta)) = self.meta_rx.try_recv() {
-            let tag_mask = self.state.project.clip_tag_mask(id);
-            if let Some(clip) = self.state.project.clips.get_mut(&id) {
-                clip.duration = meta.duration;
-                clip.resolution = meta.resolution;
-                clip.codec = meta.codec;
-                clip.audio_only = !meta.has_video;
-                clip.rebuild_search_haystack(tag_mask);
-                if !meta.has_video {
-                    self.textures.pending_thumbnails.remove(&id);
-                }
-            }
-            received = true;
-        }
-
-        while let Ok(pf) = self.preview.result_rx.try_recv() {
-            let texture = ctx.load_texture(
-                format!("preview_{:?}_{}", pf.clip_id, pf.index),
-                egui::ColorImage::from_rgba_unmultiplied(
-                    [pf.image.width() as usize, pf.image.height() as usize],
-                    pf.image.as_raw(),
-                ),
-                egui::TextureOptions::LINEAR,
-            );
-            let frames = self
-                .textures
-                .preview_frames
-                .entry(pf.clip_id)
-                .or_insert_with(|| Vec::with_capacity(pf.total));
-            if frames.len() <= pf.index {
-                frames.resize_with(pf.index + 1, || {
-                    ctx.load_texture(
-                        "placeholder",
-                        egui::ColorImage::new([1, 1], egui::Color32::TRANSPARENT),
-                        Default::default(),
-                    )
-                });
-            }
-            frames[pf.index] = texture;
-            received = true;
-        }
-
-        while let Ok(sf) = self.scrub_cache.result_rx.try_recv() {
+        // Scrubbing needs immediate visual feedback; process scrub results first.
+        while within_budget() {
+            let Ok(sf) = self.scrub_cache.result_rx.try_recv() else {
+                break;
+            };
             let texture = ctx.load_texture(
                 format!("scrub_{:?}_{}", sf.clip_id, sf.index),
                 egui::ColorImage::from_rgba_unmultiplied(
@@ -93,7 +57,75 @@ impl EditorApp {
             received = true;
         }
 
-        while let Ok((id, peaks)) = self.waveform_rx.try_recv() {
+        while within_budget() {
+            let Ok((id, meta)) = self.meta_rx.try_recv() else {
+                break;
+            };
+            let tag_mask = self.state.project.clip_tag_mask(id);
+            if let Some(clip) = self.state.project.clips.get_mut(&id) {
+                clip.duration = meta.duration;
+                clip.resolution = meta.resolution;
+                clip.codec = meta.codec;
+                clip.audio_only = !meta.has_video;
+                clip.rebuild_search_haystack(tag_mask);
+                if !meta.has_video {
+                    self.textures.pending_thumbnails.remove(&id);
+                }
+            }
+            received = true;
+        }
+
+        while within_budget() {
+            let Ok(pf) = self.preview.result_rx.try_recv() else {
+                break;
+            };
+            let texture = ctx.load_texture(
+                format!("preview_{:?}_{}", pf.clip_id, pf.index),
+                egui::ColorImage::from_rgba_unmultiplied(
+                    [pf.image.width() as usize, pf.image.height() as usize],
+                    pf.image.as_raw(),
+                ),
+                egui::TextureOptions::LINEAR,
+            );
+            let frames = self
+                .textures
+                .preview_frames
+                .entry(pf.clip_id)
+                .or_insert_with(|| Vec::with_capacity(pf.total));
+            if frames.len() <= pf.index {
+                frames.resize_with(pf.index + 1, || {
+                    ctx.load_texture(
+                        "placeholder",
+                        egui::ColorImage::new([1, 1], egui::Color32::TRANSPARENT),
+                        Default::default(),
+                    )
+                });
+            }
+            frames[pf.index] = texture;
+            received = true;
+        }
+
+        while within_budget() {
+            let Ok((id, img)) = self.thumb_rx.try_recv() else {
+                break;
+            };
+            let texture = ctx.load_texture(
+                format!("thumb_{:?}", id),
+                egui::ColorImage::from_rgba_unmultiplied(
+                    [img.width() as usize, img.height() as usize],
+                    img.as_raw(),
+                ),
+                egui::TextureOptions::LINEAR,
+            );
+            self.textures.thumbnails.insert(id, texture);
+            self.textures.pending_thumbnails.remove(&id);
+            received = true;
+        }
+
+        while within_budget() {
+            let Ok((id, peaks)) = self.waveform_rx.try_recv() else {
+                break;
+            };
             self.textures.waveform_peaks.insert(id, peaks);
             received = true;
         }

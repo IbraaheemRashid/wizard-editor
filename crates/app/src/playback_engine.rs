@@ -3,9 +3,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use wizard_audio::output::{AudioOutput, AudioProducer};
-use wizard_media::pipeline::{
-    AudioOnlyHandle, DecodedFrame, PipelineHandle, ReversePipelineHandle,
-};
+use wizard_media::gst_pipeline::{GstAudioOnlyHandle, GstReversePipelineHandle};
+use wizard_media::pipeline::DecodedFrame;
 use wizard_state::clip::ClipId;
 use wizard_state::playback::PlaybackState;
 use wizard_state::project::AppState;
@@ -14,22 +13,19 @@ use wizard_state::timeline::TimelineClipId;
 use crate::audio_mixer::AudioMixer;
 use crate::constants::*;
 use crate::pipeline::{
-    ForwardPipelineState, PipelineStatus, ReversePipelineState, ShadowPipelineState,
+    ForwardPipelineState, PendingPipeline, PendingShadowPipeline, PipelineStatus,
+    ReversePipelineState, ShadowAudioSourceRequest, ShadowPipelineState,
 };
 use crate::texture_cache::TextureCache;
 use crate::workers;
 use crate::workers::audio_worker::{AudioPreviewRequest, AudioWorkerChannels};
 use crate::workers::video_decode_worker::{VideoDecodeRequest, VideoDecodeWorkerChannels};
 
-static SCRUB_CLEAR_LOG_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-static FIRST_FRAME_LOGGED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-static FALLBACK_APPLY_LOG_COUNT: std::sync::atomic::AtomicU32 =
-    std::sync::atomic::AtomicU32::new(0);
-
 pub struct PlaybackEngine {
     pub forward: Option<ForwardPipelineState>,
+    pub pending_forward: Option<PendingPipeline>,
     pub shadow: Option<ShadowPipelineState>,
+    pub pending_shadow: Option<PendingShadowPipeline>,
     pub reverse: Option<ReversePipelineState>,
 
     pub audio_output: Option<AudioOutput>,
@@ -52,6 +48,7 @@ pub struct PlaybackEngine {
     pub last_playhead_observed: f64,
     pub video_fps_window_start: Option<f64>,
     pub video_fps_window_frames: u32,
+    pub runtime_log_frames: u32,
 }
 
 impl PlaybackEngine {
@@ -68,7 +65,9 @@ impl PlaybackEngine {
 
         Self {
             forward: None,
+            pending_forward: None,
             shadow: None,
+            pending_shadow: None,
             reverse: None,
             audio_output,
             audio_producer,
@@ -88,6 +87,7 @@ impl PlaybackEngine {
             last_playhead_observed: 0.0,
             video_fps_window_start: None,
             video_fps_window_frames: 0,
+            runtime_log_frames: 0,
         }
     }
 
@@ -130,6 +130,8 @@ impl PlaybackEngine {
         self.last_video_decode_request = None;
         self.last_decoded_frame = None;
         self.shadow = None;
+        self.pending_shadow = None;
+        self.pending_forward = None;
         self.reset_audio_sources();
     }
 
@@ -145,8 +147,10 @@ impl PlaybackEngine {
         );
         if direction_switched {
             self.forward = None;
+            self.pending_forward = None;
             self.reverse = None;
             self.shadow = None;
+            self.pending_shadow = None;
             self.handle_playback_stop_transition();
         }
     }
@@ -163,7 +167,9 @@ impl PlaybackEngine {
         }
     }
 
-    pub fn manage_shadow_pipeline(&mut self, state: &mut AppState, _now: f64) {
+    pub fn manage_shadow_pipeline(&mut self, state: &mut AppState, now: f64) {
+        self.poll_pending_shadow_pipeline(now);
+
         if state.project.playback.state != PlaybackState::Playing {
             return;
         }
@@ -174,6 +180,17 @@ impl PlaybackEngine {
         let current_timeline_clip = fwd.timeline_clip;
 
         if let Some(ref shadow) = self.shadow {
+            if let Some(next_hit) = state
+                .project
+                .timeline
+                .next_clip_after(current_timeline_clip)
+            {
+                if shadow.timeline_clip == next_hit.clip.id {
+                    return;
+                }
+            }
+        }
+        if let Some(ref shadow) = self.pending_shadow {
             if let Some(next_hit) = state
                 .project
                 .timeline
@@ -214,55 +231,76 @@ impl PlaybackEngine {
         let path = clip.path.clone();
 
         self.shadow = None;
+        self.pending_shadow = None;
 
-        match PipelineHandle::start(
+        let next_time = state
+            .project
+            .timeline
+            .find_clip(current_timeline_clip)
+            .map(|(_, _, tc)| tc.timeline_start + tc.duration)
+            .unwrap_or(state.project.playback.playhead);
+
+        let mut audio_requests = Vec::new();
+        let audio_hits = state.project.timeline.audio_clips_at_time(next_time);
+        for hit in audio_hits {
+            let Some(aclip) = state.project.clips.get(&hit.clip.source_id) else {
+                continue;
+            };
+            if self.path_has_no_audio(&aclip.path) {
+                continue;
+            }
+            audio_requests.push(ShadowAudioSourceRequest {
+                path: aclip.path.clone(),
+                source_time: hit.source_time,
+            });
+        }
+
+        eprintln!(
+            "[SHADOW] spawn queued clip={next_timeline_clip_id:?} audio_sources={}",
+            audio_requests.len()
+        );
+        self.pending_shadow = Some(PendingShadowPipeline::spawn(
             &path,
             next_hit.source_time,
             workers::video_decode_worker::PLAYBACK_DECODE_WIDTH,
             workers::video_decode_worker::PLAYBACK_DECODE_HEIGHT,
-            None,
             self.audio_sample_rate,
             self.audio_channels,
             speed,
-        ) {
-            Ok(handle) => {
-                let next_time = state
-                    .project
-                    .timeline
-                    .find_clip(current_timeline_clip)
-                    .map(|(_, _, tc)| tc.timeline_start + tc.duration)
-                    .unwrap_or(state.project.playback.playhead);
+            next_clip_id,
+            next_timeline_clip_id,
+            audio_requests,
+            now,
+        ));
+    }
 
-                let mut audio_sources = Vec::new();
-                let audio_hits = state.project.timeline.audio_clips_at_time(next_time);
-                for hit in audio_hits {
-                    let Some(aclip) = state.project.clips.get(&hit.clip.source_id) else {
-                        continue;
-                    };
-                    if self.path_has_no_audio(&aclip.path) {
-                        continue;
-                    }
-                    let (producer, consumer) = AudioMixer::create_source_producer();
-                    let source_producer = Arc::new(Mutex::new(producer));
-                    if let Ok(audio_handle) = AudioOnlyHandle::start(
-                        &aclip.path,
-                        hit.source_time,
-                        source_producer,
-                        self.audio_sample_rate,
-                        self.audio_channels,
-                        speed,
-                    ) {
-                        audio_sources.push((audio_handle, consumer));
-                    }
-                }
+    pub fn poll_pending_shadow_pipeline(&mut self, now: f64) {
+        let pending = match self.pending_shadow.as_ref() {
+            Some(p) => p,
+            None => return,
+        };
 
+        let result = match pending.try_recv() {
+            Some(r) => r,
+            None => return,
+        };
+
+        let pending = self.pending_shadow.take().expect("checked above");
+        let wait_ms = (now - pending.started_at) * 1000.0;
+
+        match result {
+            Ok(build) => {
+                eprintln!(
+                    "[SHADOW] pipeline arrived after {wait_ms:.1}ms, audio_sources={}",
+                    build.audio_sources.len()
+                );
                 self.shadow = Some(ShadowPipelineState {
-                    handle,
-                    clip: (next_clip_id, path),
-                    timeline_clip: next_timeline_clip_id,
+                    handle: build.handle,
+                    clip: pending.clip,
+                    timeline_clip: pending.timeline_clip,
                     first_frame_ready: false,
                     buffered_frame: None,
-                    audio_sources,
+                    audio_sources: build.audio_sources,
                 });
             }
             Err(e) => {
@@ -293,15 +331,22 @@ impl PlaybackEngine {
 
         let shadow = self.shadow.take().expect("shadow checked above");
 
+        let _ = shadow.handle.begin_playing();
+
         let mut fwd = ForwardPipelineState {
             handle: shadow.handle,
             clip: shadow.clip,
             timeline_clip: shadow.timeline_clip,
             pts_offset: None,
             speed: state.project.playback.speed,
-            frame_delivered: false,
+            frame_delivered: shadow.buffered_frame.is_some(),
+            activated: true,
             started_at: now,
-            last_frame_time: None,
+            last_frame_time: if shadow.buffered_frame.is_some() {
+                Some(now)
+            } else {
+                None
+            },
             age: 0,
         };
 
@@ -329,6 +374,9 @@ impl PlaybackEngine {
         self.forward = Some(fwd);
 
         if !shadow.audio_sources.is_empty() {
+            for (ref audio_handle, _) in &shadow.audio_sources {
+                let _ = audio_handle.begin_playing();
+            }
             self.mixer.replace_sources(shadow.audio_sources);
             if let Some(ref output) = self.audio_output {
                 output.clear_buffer();
@@ -341,6 +389,22 @@ impl PlaybackEngine {
         true
     }
 
+    pub fn try_activate_pipeline(&mut self) {
+        if let Some(ref mut fwd) = self.forward {
+            if !fwd.activated && fwd.handle.is_first_frame_ready() {
+                fwd.activated = true;
+                eprintln!("[ACTIVATE] forward pipeline -> Playing");
+                let _ = fwd.handle.begin_playing();
+            }
+        }
+        if let Some(ref mut rev) = self.reverse {
+            if !rev.activated && rev.handle.is_first_frame_ready() {
+                rev.activated = true;
+                let _ = rev.handle.begin_playing();
+            }
+        }
+    }
+
     pub fn manage_pipeline(
         &mut self,
         state: &mut AppState,
@@ -348,27 +412,17 @@ impl PlaybackEngine {
         now: f64,
         _ctx: &egui::Context,
     ) {
+        self.try_activate_pipeline();
+
         let is_forward = state.project.playback.state == PlaybackState::Playing;
         let is_reverse = state.project.playback.state == PlaybackState::PlayingReverse;
         let is_playing = self.is_playing(state);
         let is_scrubbing = state.ui.timeline.scrubbing.is_some();
 
         if !is_forward && self.forward.is_some() {
-            if SCRUB_CLEAR_LOG_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 20 {
-                crate::debug_log::emit(
-                    "H6",
-                    "crates/app/src/playback_engine.rs:manage_pipeline",
-                    "forward pipeline cleared because playback not in forward state",
-                    serde_json::json!({
-                        "playbackState": format!("{:?}", state.project.playback.state),
-                        "wasScrubbing": self.was_scrubbing,
-                        "isScrubbing": is_scrubbing,
-                        "hadForward": self.forward.is_some()
-                    }),
-                );
-            }
             self.forward = None;
             self.shadow = None;
+            self.pending_shadow = None;
         }
 
         if !is_reverse && self.reverse.is_some() {
@@ -390,8 +444,10 @@ impl PlaybackEngine {
         let Some(hit) = hit else {
             let had_pipeline = self.forward.is_some() || self.reverse.is_some();
             self.forward = None;
+            self.pending_forward = None;
             self.reverse = None;
             self.shadow = None;
+            self.pending_shadow = None;
             textures.playback_texture = None;
             self.last_decoded_frame = None;
             if had_pipeline {
@@ -421,24 +477,11 @@ impl PlaybackEngine {
         let scrub_just_released = self.was_scrubbing && !is_scrubbing;
 
         if is_scrubbing {
-            if SCRUB_CLEAR_LOG_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 20 {
-                crate::debug_log::emit(
-                    "H6",
-                    "crates/app/src/playback_engine.rs:manage_pipeline",
-                    "pipeline cleared due active scrubbing",
-                    serde_json::json!({
-                        "playhead": playhead,
-                        "scrubTime": state.ui.timeline.scrubbing,
-                        "wasScrubbing": self.was_scrubbing,
-                        "playbackState": format!("{:?}", state.project.playback.state),
-                        "hadForward": self.forward.is_some(),
-                        "hadReverse": self.reverse.is_some()
-                    }),
-                );
-            }
             self.forward = None;
+            self.pending_forward = None;
             self.reverse = None;
             self.shadow = None;
+            self.pending_shadow = None;
             self.reset_audio_sources();
             self.was_scrubbing = true;
             return;
@@ -453,8 +496,13 @@ impl PlaybackEngine {
             let fwd_speed = self.forward.as_ref().map(|f| f.speed).unwrap_or(speed);
             let speed_changed = self.forward.is_some() && (speed - fwd_speed).abs() > 0.01;
 
+            let pending_matches = self
+                .pending_forward
+                .as_ref()
+                .is_some_and(|p| p.timeline_clip == timeline_clip_id && p.clip.0 == clip_id);
+
             let needs_new_pipeline = match self.forward.as_ref() {
-                None => true,
+                None => !pending_matches,
                 Some(fwd) => {
                     fwd.age >= 2
                         && (fwd.timeline_clip != timeline_clip_id
@@ -468,28 +516,24 @@ impl PlaybackEngine {
                     fwd.handle.update_speed(speed);
                     fwd.speed = speed;
                 }
+                self.reset_audio_sources();
+                self.start_audio_sources(state);
             }
 
             let last_frame_time = self.last_pipeline_frame_time();
             let has_stale_pipeline =
                 last_frame_time.is_some_and(|t| (now - t) > STALE_PIPELINE_THRESHOLD_S);
             if self.forward.is_some() && has_stale_pipeline && !needs_new_pipeline {
-                crate::debug_log::emit(
-                    "H2",
-                    "crates/app/src/playback_engine.rs:manage_pipeline",
-                    "forward pipeline restarted after stale frame gap",
-                    serde_json::json!({
-                        "now": now,
-                        "lastPipelineFrameTime": last_frame_time,
-                        "staleThresholdSeconds": STALE_PIPELINE_THRESHOLD_S,
-                        "playhead": state.project.playback.playhead,
-                        "timelineClipId": format!("{:?}", timeline_clip_id),
-                        "clipId": format!("{:?}", clip_id)
-                    }),
+                eprintln!(
+                    "[MANAGE] STALE pipeline restart! last_frame_time={:?} now={now:.3} gap={:.3}s playhead={:.3}",
+                    last_frame_time,
+                    last_frame_time.map(|t| now - t).unwrap_or(0.0),
+                    state.project.playback.playhead
                 );
-
                 self.forward = None;
+                self.pending_forward = None;
                 self.shadow = None;
+                self.pending_shadow = None;
                 self.reset_audio_sources();
                 self.start_pipeline(
                     state,
@@ -505,29 +549,14 @@ impl PlaybackEngine {
             }
 
             if scrub_just_released || needs_new_pipeline {
-                crate::debug_log::emit(
-                    "H2",
-                    "crates/app/src/playback_engine.rs:manage_pipeline",
-                    "forward pipeline replaced due clip/scrub transition",
-                    serde_json::json!({
-                        "needsNewPipeline": needs_new_pipeline,
-                        "scrubJustReleased": scrub_just_released,
-                        "hadForward": self.forward.is_some(),
-                        "playhead": playhead,
-                        "hitSourceTime": hit.source_time,
-                        "timelineClipId": format!("{:?}", timeline_clip_id),
-                        "clipId": format!("{:?}", clip_id)
-                    }),
+                eprintln!(
+                    "[MANAGE] pipeline restart: scrub_released={scrub_just_released} needs_new={needs_new_pipeline} playhead={:.3}",
+                    state.project.playback.playhead
                 );
-
-                if DEBUG_PLAYBACK {
-                    eprintln!("[DBG] needs_new_pipeline={needs_new_pipeline} scrub_just_released={scrub_just_released} forward.is_some()={}", self.forward.is_some());
-                    if let Some(ref fwd) = self.forward {
-                        eprintln!("[DBG]   fwd.timeline_clip={:?} vs {:?}, fwd.clip.0={:?} vs {:?}, path_match={}", fwd.timeline_clip, timeline_clip_id, fwd.clip.0, clip_id, fwd.clip.1 == path);
-                    }
-                }
                 self.forward = None;
+                self.pending_forward = None;
                 self.shadow = None;
+                self.pending_shadow = None;
                 if scrub_just_released {
                     self.reset_audio_sources();
                 }
@@ -588,7 +617,7 @@ impl PlaybackEngine {
 
         if needs_new {
             self.reverse = None;
-            match ReversePipelineHandle::start(
+            match GstReversePipelineHandle::start(
                 path,
                 source_time,
                 speed,
@@ -602,9 +631,21 @@ impl PlaybackEngine {
                         timeline_clip: timeline_clip_id,
                         pts_offset: None,
                         speed,
+                        activated: false,
                         started_at: now,
                         last_frame_time: None,
                     });
+                    for _ in 0..50 {
+                        if self
+                            .reverse
+                            .as_ref()
+                            .is_some_and(|r| r.handle.is_first_frame_ready())
+                        {
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_micros(100));
+                    }
+                    self.try_activate_pipeline();
                     self.show_scrub_cache_bridge_frame(textures, clip_id, source_time);
                 }
                 Err(e) => {
@@ -625,61 +666,25 @@ impl PlaybackEngine {
         source_time: f64,
         now: f64,
     ) {
-        if DEBUG_PLAYBACK {
-            eprintln!("[DBG] start_pipeline called, source_time={source_time:.3}s");
-        }
-
-        crate::debug_log::emit(
-            "H1",
-            "crates/app/src/playback_engine.rs:start_pipeline",
-            "pipeline start requested",
-            serde_json::json!({
-                "sourceTime": source_time,
-                "playhead": state.project.playback.playhead,
-                "speed": state.project.playback.speed,
-                "timelineClipId": format!("{:?}", timeline_clip_id),
-                "clipId": format!("{:?}", clip_id),
-                "hadForward": self.forward.is_some(),
-                "hadShadow": self.shadow.is_some(),
-                "hadReverse": self.reverse.is_some()
-            }),
-        );
-
         self.reset_audio_sources();
 
         let speed = state.project.playback.speed;
 
-        match PipelineHandle::start(
+        self.pending_forward = Some(PendingPipeline::spawn(
             path,
             source_time,
             workers::video_decode_worker::PLAYBACK_DECODE_WIDTH,
             workers::video_decode_worker::PLAYBACK_DECODE_HEIGHT,
-            None,
             self.audio_sample_rate,
             self.audio_channels,
             speed,
-        ) {
-            Ok(handle) => {
-                self.forward = Some(ForwardPipelineState {
-                    handle,
-                    clip: (clip_id, path.to_path_buf()),
-                    timeline_clip: timeline_clip_id,
-                    pts_offset: None,
-                    speed,
-                    frame_delivered: false,
-                    started_at: now,
-                    last_frame_time: None,
-                    age: 0,
-                });
-                if textures.playback_texture.is_none() {
-                    self.show_scrub_cache_bridge_frame(textures, clip_id, source_time);
-                }
-                self.last_video_decode_request = None;
-            }
-            Err(e) => {
-                eprintln!("Failed to start pipeline: {e}");
-            }
-        }
+            clip_id,
+            timeline_clip_id,
+            now,
+        ));
+
+        self.show_scrub_cache_bridge_frame(textures, clip_id, source_time);
+        self.last_video_decode_request = None;
 
         self.start_audio_sources(state);
 
@@ -691,6 +696,47 @@ impl PlaybackEngine {
         }
     }
 
+    pub fn poll_pending_pipeline(&mut self, now: f64) {
+        let pending = match self.pending_forward.as_ref() {
+            Some(p) => p,
+            None => return,
+        };
+
+        let result = match pending.try_recv() {
+            Some(r) => r,
+            None => return,
+        };
+
+        let pending = self.pending_forward.take().expect("checked above");
+        let wait_ms = (now - pending.started_at) * 1000.0;
+
+        match result {
+            Ok(handle) => {
+                let first_ready = handle.is_first_frame_ready();
+                eprintln!(
+                    "[PENDING] pipeline arrived after {wait_ms:.1}ms, first_frame_ready={first_ready}"
+                );
+                self.runtime_log_frames = 0;
+                self.forward = Some(ForwardPipelineState {
+                    handle,
+                    clip: pending.clip,
+                    timeline_clip: pending.timeline_clip,
+                    pts_offset: None,
+                    speed: pending.speed,
+                    frame_delivered: false,
+                    activated: false,
+                    started_at: pending.started_at,
+                    last_frame_time: None,
+                    age: 0,
+                });
+                self.try_activate_pipeline();
+            }
+            Err(e) => {
+                eprintln!("Failed to start pipeline: {e}");
+            }
+        }
+    }
+
     pub fn start_audio_sources(&mut self, state: &AppState) {
         self.mixer.clear();
 
@@ -698,20 +744,6 @@ impl PlaybackEngine {
         let speed = state.project.playback.speed;
         let hits = state.project.timeline.audio_clips_at_time(playhead);
 
-        crate::debug_log::emit(
-            "H9",
-            "crates/app/src/playback_engine.rs:start_audio_sources",
-            "starting audio sources for current playhead",
-            serde_json::json!({
-                "playhead": playhead,
-                "speed": speed,
-                "audioHits": hits.len(),
-                "sampleRate": self.audio_sample_rate,
-                "channels": self.audio_channels
-            }),
-        );
-
-        let mut started_count = 0usize;
         for hit in hits {
             let Some(clip) = state.project.clips.get(&hit.clip.source_id) else {
                 continue;
@@ -724,7 +756,7 @@ impl PlaybackEngine {
             let (producer, consumer) = AudioMixer::create_source_producer();
             let source_producer = Arc::new(Mutex::new(producer));
 
-            match AudioOnlyHandle::start(
+            match GstAudioOnlyHandle::start(
                 &path,
                 hit.source_time,
                 source_producer,
@@ -733,25 +765,14 @@ impl PlaybackEngine {
                 speed,
             ) {
                 Ok(handle) => {
+                    let _ = handle.begin_playing();
                     self.mixer.add_source(handle, consumer);
-                    started_count += 1;
                 }
                 Err(e) => {
                     eprintln!("Failed to start audio source: {e}");
                 }
             }
         }
-
-        crate::debug_log::emit(
-            "H9",
-            "crates/app/src/playback_engine.rs:start_audio_sources",
-            "audio sources started",
-            serde_json::json!({
-                "startedCount": started_count,
-                "mixerSourceCount": self.mixer.source_count(),
-                "playhead": playhead
-            }),
-        );
     }
 
     pub fn apply_pipeline_frame(
@@ -790,47 +811,54 @@ impl PlaybackEngine {
             };
             let mapped_source_pts = frame.pts_seconds - pts_offset;
 
-            if mapped_source_pts >= source_out && fwd.age >= 2 {
-                let next_time = timeline_start + duration;
-                state.project.playback.playhead = next_time;
-                self.forward = None;
+            if mapped_source_pts >= source_out {
+                let playhead_near_end = state.project.playback.playhead >= (timeline_start + duration - 0.016);
+                if playhead_near_end && fwd.age >= 2 {
+                    let next_time = timeline_start + duration;
+                    state.project.playback.playhead = next_time;
+                    self.forward = None;
 
-                if let Some(next_hit) = state.project.timeline.video_clip_at_time(next_time) {
-                    let next_hit_clone = next_hit.clone();
-                    if self.promote_shadow_pipeline(
-                        state,
-                        textures,
-                        next_time,
-                        &next_hit_clone,
-                        now,
-                        ctx,
-                    ) {
-                        return false;
-                    }
-
-                    let next_clip_id = next_hit.clip.source_id;
-                    let next_timeline_clip_id = next_hit.clip.id;
-                    if let Some(clip) = state.project.clips.get(&next_clip_id) {
-                        let path = clip.path.clone();
-                        self.start_pipeline(
+                    if let Some(next_hit) = state.project.timeline.video_clip_at_time(next_time) {
+                        let next_hit_clone = next_hit.clone();
+                        if self.promote_shadow_pipeline(
                             state,
                             textures,
-                            next_timeline_clip_id,
-                            next_clip_id,
-                            &path,
-                            next_hit.source_time,
+                            next_time,
+                            &next_hit_clone,
                             now,
-                        );
+                            ctx,
+                        ) {
+                            return false;
+                        }
+
+                        let next_clip_id = next_hit.clip.source_id;
+                        let next_timeline_clip_id = next_hit.clip.id;
+                        if let Some(clip) = state.project.clips.get(&next_clip_id) {
+                            let path = clip.path.clone();
+                            self.start_pipeline(
+                                state,
+                                textures,
+                                next_timeline_clip_id,
+                                next_clip_id,
+                                &path,
+                                next_hit.source_time,
+                                now,
+                            );
+                        }
+                    } else {
+                        self.reset_audio_sources();
                     }
-                } else {
-                    self.reset_audio_sources();
+                    return false;
                 }
-                return false;
+                if let Some(ref mut fwd) = self.forward {
+                    fwd.last_frame_time = Some(now);
+                }
+                return true;
             }
 
             if mapped_source_pts >= source_in && mapped_source_pts < source_out {
-                let new_playhead = timeline_start + (mapped_source_pts - source_in);
-                if new_playhead >= state.project.playback.playhead || !fwd.frame_delivered {
+                if !fwd.frame_delivered {
+                    let new_playhead = timeline_start + (mapped_source_pts - source_in);
                     state.project.playback.playhead = new_playhead;
                 }
                 fwd.frame_delivered = true;
@@ -904,7 +932,7 @@ impl PlaybackEngine {
                             if let Some(clip) = state.project.clips.get(&prev_clip_id) {
                                 let path = clip.path.clone();
                                 let speed = state.project.playback.speed;
-                                if let Ok(handle) = ReversePipelineHandle::start(
+                                if let Ok(handle) = GstReversePipelineHandle::start(
                                     &path,
                                     prev_hit.source_time,
                                     speed,
@@ -917,6 +945,7 @@ impl PlaybackEngine {
                                         timeline_clip: prev_timeline_clip_id,
                                         pts_offset: None,
                                         speed,
+                                        activated: false,
                                         started_at: now,
                                         last_frame_time: None,
                                     });
@@ -962,6 +991,72 @@ impl PlaybackEngine {
         None
     }
 
+    fn pick_best_frame_for_playhead(
+        &self,
+        state: &AppState,
+        frames: &[DecodedFrame],
+    ) -> usize {
+        let playhead = state.project.playback.playhead;
+        let pts_offset = self.forward.as_ref().and_then(|f| f.pts_offset);
+        let mut best_idx = 0;
+        for (i, frame) in frames.iter().enumerate() {
+            let mapped = match pts_offset {
+                Some(off) => frame.pts_seconds - off,
+                None => frame.pts_seconds,
+            };
+            let timeline_pos = self
+                .forward
+                .as_ref()
+                .and_then(|fwd| {
+                    state
+                        .project
+                        .timeline
+                        .find_clip(fwd.timeline_clip)
+                        .map(|(_, _, tc)| tc.timeline_start + (mapped - tc.source_in))
+                })
+                .unwrap_or(mapped);
+            if timeline_pos <= playhead + 0.05 {
+                best_idx = i;
+            } else {
+                break;
+            }
+        }
+        best_idx
+    }
+
+    fn pick_best_reverse_frame_for_playhead(
+        &self,
+        state: &AppState,
+        frames: &[DecodedFrame],
+    ) -> usize {
+        let playhead = state.project.playback.playhead;
+        let pts_offset = self.reverse.as_ref().and_then(|r| r.pts_offset);
+        let mut best_idx = frames.len() - 1;
+        for (i, frame) in frames.iter().enumerate() {
+            let mapped = match pts_offset {
+                Some(off) => frame.pts_seconds - off,
+                None => frame.pts_seconds,
+            };
+            let timeline_pos = self
+                .reverse
+                .as_ref()
+                .and_then(|rev| {
+                    state
+                        .project
+                        .timeline
+                        .find_clip(rev.timeline_clip)
+                        .map(|(_, _, tc)| tc.timeline_start + (mapped - tc.source_in))
+                })
+                .unwrap_or(mapped);
+            if timeline_pos >= playhead - 0.05 {
+                best_idx = i;
+            } else {
+                break;
+            }
+        }
+        best_idx
+    }
+
     fn update_video_fps(&mut self, state: &mut AppState, now: f64) {
         if self.video_fps_window_start.is_none() {
             self.video_fps_window_start = Some(now);
@@ -996,7 +1091,6 @@ impl PlaybackEngine {
 
         let fwd_status = self.forward.as_ref().map(|f| f.status(now));
         let fwd_frame_delivered = self.pipeline_frame_delivered();
-        let fwd_started_at = self.forward.as_ref().map(|f| f.started_at);
         let rev_status = self.reverse.as_ref().map(|r| r.status(now));
 
         while let Ok(result) = self.video_decode.result_rx.try_recv() {
@@ -1041,24 +1135,6 @@ impl PlaybackEngine {
             if should_preserve_pipeline_texture {
                 continue;
             }
-            if FALLBACK_APPLY_LOG_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 20 {
-                crate::debug_log::emit(
-                    "H3",
-                    "crates/app/src/playback_engine.rs:poll_pipeline_frames",
-                    "fallback decode frame applied to playback texture",
-                    serde_json::json!({
-                        "playbackState": format!("{:?}", state.project.playback.state),
-                        "forwardPresent": self.forward.is_some(),
-                        "reversePresent": self.reverse.is_some(),
-                        "forwardPipelineStalled": forward_pipeline_stalled,
-                        "forwardAwaitingFirst": forward_awaiting_first,
-                        "reversePipelineStalled": reverse_pipeline_stalled,
-                        "reverseAwaitingFirst": reverse_awaiting_first,
-                        "sourceTime": result.time_seconds
-                    }),
-                );
-            }
-
             let img = result.image.as_ref();
             textures.update_playback_texture(
                 ctx,
@@ -1077,32 +1153,12 @@ impl PlaybackEngine {
                 pipeline_frames.push(frame);
             }
         }
-        if DEBUG_PLAYBACK && !pipeline_frames.is_empty() && !fwd_frame_delivered {
-            let elapsed_ms = fwd_started_at.map(|t| (now - t) * 1000.0).unwrap_or(0.0);
-            let pts = pipeline_frames[0].pts_seconds;
-            eprintln!(
-                "[DBG] first pipeline frame arrived, latency={elapsed_ms:.1}ms, pts={pts:.3}"
-            );
-
-            crate::debug_log::emit(
-                "H1",
-                "crates/app/src/playback_engine.rs:poll_pipeline_frames",
-                "first forward pipeline frame received",
-                serde_json::json!({
-                    "elapsedMs": elapsed_ms,
-                    "firstPts": pts,
-                    "frameBatchCount": pipeline_frames.len(),
-                    "playhead": state.project.playback.playhead
-                }),
-            );
-
-            FIRST_FRAME_LOGGED.store(false, std::sync::atomic::Ordering::Relaxed);
-        }
-        for frame in &pipeline_frames {
+        if !pipeline_frames.is_empty() {
             received = true;
-            if !self.apply_pipeline_frame(state, textures, ctx, frame, now) {
-                break;
-            }
+            let best_idx = self.pick_best_frame_for_playhead(state, &pipeline_frames);
+            let frame = &pipeline_frames[best_idx];
+            self.runtime_log_frames += 1;
+            self.apply_pipeline_frame(state, textures, ctx, frame, now);
         }
         if let Some(ref fwd) = self.forward {
             for mut frame in pipeline_frames {
@@ -1119,11 +1175,11 @@ impl PlaybackEngine {
                 reverse_frames.push(frame);
             }
         }
-        for frame in &reverse_frames {
+        if !reverse_frames.is_empty() {
             received = true;
-            if !self.apply_reverse_pipeline_frame(state, textures, ctx, frame, now) {
-                break;
-            }
+            let best_idx = self.pick_best_reverse_frame_for_playhead(state, &reverse_frames);
+            let frame = &reverse_frames[best_idx];
+            self.apply_reverse_pipeline_frame(state, textures, ctx, frame, now);
         }
 
         let mut last_snippet: Option<crate::workers::audio_worker::AudioSnippet> = None;
@@ -1270,8 +1326,10 @@ impl PlaybackEngine {
         let playhead = state.project.playback.playhead;
         let is_active = state.project.playback.state != PlaybackState::Stopped;
         let is_scrubbing = state.ui.timeline.scrubbing.is_some();
+        let playhead_changed_while_stopped =
+            !is_active && (playhead - self.last_playhead_observed).abs() > f64::EPSILON;
 
-        if !is_active && !is_scrubbing {
+        if !is_active && !is_scrubbing && !playhead_changed_while_stopped {
             return;
         }
 

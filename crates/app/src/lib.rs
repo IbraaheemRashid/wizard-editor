@@ -1,7 +1,6 @@
 mod audio_mixer;
 mod channel_polling;
 mod constants;
-mod debug_log;
 mod import;
 pub mod pipeline;
 mod playback;
@@ -13,6 +12,7 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use notify::RecommendedWatcher;
 use wizard_audio::output::AudioOutput;
@@ -21,16 +21,15 @@ use wizard_state::clip::ClipId;
 use wizard_state::playback::PlaybackState;
 use wizard_state::project::AppState;
 
-use pipeline::PipelineStatus;
+use crate::constants::{
+    PLAYHEAD_ADVANCE_DEBT_MAX_S, PLAYHEAD_ADVANCE_MAX_DT_S, UI_HITCH_LOG_THRESHOLD_S,
+    UI_PROFILE_LOG_THRESHOLD_S,
+};
 use playback_engine::PlaybackEngine;
 use texture_cache::TextureCache;
 use workers::preview_worker::PreviewWorkerChannels;
 use workers::scrub_cache_worker::ScrubCacheWorkerChannels;
 
-use crate::constants::*;
-
-static CLOCK_ADVANCE_LOG_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-static PLAYHEAD_JUMP_LOG_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 pub struct EditorApp {
     state: AppState,
@@ -52,6 +51,7 @@ pub struct EditorApp {
     known_paths: HashSet<PathBuf>,
 
     last_frame_time: Option<f64>,
+    playhead_advance_debt_s: f64,
 }
 
 impl EditorApp {
@@ -123,66 +123,56 @@ impl EditorApp {
             watch_tx,
             known_paths: HashSet::new(),
             last_frame_time: None,
+            playhead_advance_debt_s: 0.0,
         }
     }
 }
 
 impl eframe::App for EditorApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let update_t0 = Instant::now();
         let was_playing = self.playback.last_is_playing;
         let previous_playback_state = self.playback.last_playback_state;
         let now = ctx.input(|i| i.time);
         if let Some(last) = self.last_frame_time {
             let dt = now - last;
+            let is_active_playback = matches!(
+                self.state.project.playback.state,
+                PlaybackState::Playing | PlaybackState::PlayingReverse
+            );
+            let _ = is_active_playback && dt > UI_HITCH_LOG_THRESHOLD_S;
             let duration = self.state.project.timeline.timeline_duration();
-            let fwd_frame_delivered = self.playback.pipeline_frame_delivered();
-            let fwd_started_at = self.playback.forward.as_ref().map(|f| f.started_at);
-            let fwd_status = self.playback.forward.as_ref().map(|f| f.stall_status(now));
-            let rev_status = self.playback.reverse.as_ref().map(|r| r.stall_status(now));
-            let pipeline_delivering = (self.playback.forward.is_some()
-                || self.playback.reverse.is_some())
-                && fwd_frame_delivered
-                && fwd_status == Some(PipelineStatus::Delivering);
-            let reverse_startup_hold = self.state.project.playback.state
-                == PlaybackState::PlayingReverse
-                && rev_status == Some(PipelineStatus::StartingUp);
-            let is_playing_forward = self.state.project.playback.state == PlaybackState::Playing;
-            let is_playing_reverse =
-                self.state.project.playback.state == PlaybackState::PlayingReverse;
-            let forward_startup_hold = is_playing_forward
-                && self.playback.forward.is_some()
-                && !fwd_frame_delivered
-                && fwd_started_at.is_some_and(|t| now - t <= FORWARD_STARTUP_LONG_GRACE_S);
-            let should_use_clock_advance =
-                (!pipeline_delivering || is_playing_forward || is_playing_reverse)
-                    && !reverse_startup_hold
-                    && !forward_startup_hold
-                    && self.state.project.playback.state != PlaybackState::Stopped;
-            if should_use_clock_advance {
-                self.state.project.playback.advance(dt, duration);
-            }
-            if DEBUG_PLAYBACK
-                && is_playing_forward
-                && !fwd_frame_delivered
-                && self.playback.forward.is_some()
-            {
-                let elapsed_ms = fwd_started_at.map(|t| (now - t) * 1000.0).unwrap_or(0.0);
-                eprintln!("[DBG] clock advancing before first frame, elapsed={elapsed_ms:.1}ms");
-
-                if CLOCK_ADVANCE_LOG_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 10 {
-                    crate::debug_log::emit(
-                        "H5",
-                        "crates/app/src/lib.rs:update",
-                        "clock advanced before first pipeline frame",
-                        serde_json::json!({
-                            "elapsedMs": elapsed_ms,
-                            "dt": dt,
-                            "playhead": self.state.project.playback.playhead,
-                            "pipelineDelivering": pipeline_delivering,
-                            "forwardPresent": self.playback.forward.is_some()
-                        }),
-                    );
+            let has_pending = self.playback.pending_forward.is_some();
+            let should_advance = match self.state.project.playback.state {
+                PlaybackState::Stopped => false,
+                PlaybackState::Playing => {
+                    if has_pending {
+                        false
+                    } else {
+                        self.playback
+                            .forward
+                            .as_ref()
+                            .is_none_or(|f| f.frame_delivered)
+                    }
                 }
+                PlaybackState::PlayingReverse => self
+                    .playback
+                    .reverse
+                    .as_ref()
+                    .is_none_or(|r| r.last_frame_time.is_some()),
+            };
+            if should_advance {
+                let total_advance = dt + self.playhead_advance_debt_s;
+                let dt_for_advance = total_advance.min(PLAYHEAD_ADVANCE_MAX_DT_S);
+                let debt_before = total_advance - dt;
+                self.playhead_advance_debt_s =
+                    (total_advance - dt_for_advance).min(PLAYHEAD_ADVANCE_DEBT_MAX_S);
+                let _ = dt_for_advance < total_advance
+                    && dt > UI_HITCH_LOG_THRESHOLD_S
+                    && debt_before >= 0.0;
+                self.state.project.playback.advance(dt_for_advance, duration);
+            } else if self.state.project.playback.state == PlaybackState::Stopped {
+                self.playhead_advance_debt_s = 0.0;
             }
             if dt > 0.0 {
                 let inst_fps = (1.0 / dt) as f32;
@@ -201,12 +191,15 @@ impl eframe::App for EditorApp {
             self.state.project.playback.state,
         );
 
+        self.playback.poll_pending_pipeline(now);
         self.playback
             .manage_pipeline(&mut self.state, &mut self.textures, now, ctx);
         self.playback.manage_shadow_pipeline(&mut self.state, now);
         self.poll_import_tasks(ctx);
         self.poll_folder_watcher();
+        let pre_ui_ms = update_t0.elapsed().as_secs_f64() * 1000.0;
 
+        let ui_t0 = Instant::now();
         egui::TopBottomPanel::top("top_panel")
             .exact_height(28.0)
             .show(ctx, |ui| {
@@ -295,51 +288,33 @@ impl eframe::App for EditorApp {
                     }
                 });
         }
+        let ui_layout_ms = ui_t0.elapsed().as_secs_f64() * 1000.0;
 
         let is_playing = self.playback.is_playing(&self.state);
         if was_playing && !is_playing {
             self.playback.handle_playback_stop_transition();
         }
 
-        let current_playhead = self.state.project.playback.playhead;
-        if self.state.project.playback.state == PlaybackState::Playing {
-            let rewind = self.playback.last_playhead_observed - current_playhead;
-            if rewind > 0.05
-                && PLAYHEAD_JUMP_LOG_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 30
-            {
-                crate::debug_log::emit(
-                    "H8",
-                    "crates/app/src/lib.rs:update",
-                    "playhead moved backward during forward playback",
-                    serde_json::json!({
-                        "previousPlayhead": self.playback.last_playhead_observed,
-                        "currentPlayhead": current_playhead,
-                        "rewindSeconds": rewind,
-                        "scrubbing": self.state.ui.timeline.scrubbing,
-                        "forwardPresent": self.playback.forward.is_some(),
-                        "reversePresent": self.playback.reverse.is_some(),
-                        "lastDecodedFrame": self.playback.last_decoded_frame.map(|(pts, src)| serde_json::json!({"pts": pts, "source": src})).unwrap_or(serde_json::Value::Null)
-                    }),
-                );
-            }
-        }
-        self.playback.last_playhead_observed = current_playhead;
+        self.playback.last_playhead_observed = self.state.project.playback.playhead;
         self.playback.last_is_playing = is_playing;
         self.playback.last_playback_state = self.state.project.playback.state;
 
-        if let Some(received) =
-            Some(
-                self.playback
-                    .poll_pipeline_frames(&mut self.state, &mut self.textures, ctx, now),
-            )
-        {
-            if received {
-                ctx.request_repaint();
-            }
+        let poll_t0 = Instant::now();
+        let received = self
+            .playback
+            .poll_pipeline_frames(&mut self.state, &mut self.textures, ctx, now);
+        let poll_frames_ms = poll_t0.elapsed().as_secs_f64() * 1000.0;
+        if received {
+            ctx.request_repaint();
         }
 
         if self.state.project.playback.state != PlaybackState::Stopped {
             ctx.request_repaint();
         }
+
+        let total_update_ms = update_t0.elapsed().as_secs_f64() * 1000.0;
+        let _ = is_playing
+            && total_update_ms > UI_PROFILE_LOG_THRESHOLD_S * 1000.0
+            && (total_update_ms - pre_ui_ms - ui_layout_ms - poll_frames_ms).max(0.0) >= 0.0;
     }
 }
