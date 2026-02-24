@@ -1,7 +1,6 @@
 mod audio_mixer;
 mod channel_polling;
 mod constants;
-mod debug_log;
 mod import;
 pub mod pipeline;
 mod playback;
@@ -12,9 +11,7 @@ pub mod workers;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::mpsc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
 
 use notify::RecommendedWatcher;
 use wizard_audio::output::AudioOutput;
@@ -23,17 +20,11 @@ use wizard_state::clip::ClipId;
 use wizard_state::playback::PlaybackState;
 use wizard_state::project::AppState;
 
-use crate::constants::{
-    PLAYHEAD_ADVANCE_DEBT_MAX_S, PLAYHEAD_ADVANCE_MAX_DT_S, UI_HITCH_LOG_THRESHOLD_S,
-    UI_PROFILE_LOG_THRESHOLD_S,
-};
+use crate::constants::{PLAYHEAD_ADVANCE_DEBT_MAX_S, PLAYHEAD_ADVANCE_MAX_DT_S};
 use playback_engine::PlaybackEngine;
 use texture_cache::TextureCache;
 use workers::preview_worker::PreviewWorkerChannels;
 use workers::scrub_cache_worker::ScrubCacheWorkerChannels;
-
-static REVERSE_ADVANCE_LOG_MS: AtomicU64 = AtomicU64::new(0);
-
 
 pub struct EditorApp {
     state: AppState,
@@ -134,17 +125,11 @@ impl EditorApp {
 
 impl eframe::App for EditorApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        let update_t0 = Instant::now();
         let was_playing = self.playback.last_is_playing;
         let previous_playback_state = self.playback.last_playback_state;
         let now = ctx.input(|i| i.time);
         if let Some(last) = self.last_frame_time {
             let dt = now - last;
-            let is_active_playback = matches!(
-                self.state.project.playback.state,
-                PlaybackState::Playing | PlaybackState::PlayingReverse
-            );
-            let _ = is_active_playback && dt > UI_HITCH_LOG_THRESHOLD_S;
             let duration = self.state.project.timeline.timeline_duration();
             let has_pending = self.playback.pending_forward.is_some();
             let should_advance = match self.state.project.playback.state {
@@ -160,48 +145,26 @@ impl eframe::App for EditorApp {
                     }
                 }
                 PlaybackState::PlayingReverse => {
-                    let has_pending = self.playback.pending_reverse.is_some();
-                    let rev_last_frame = self.playback.reverse.as_ref().and_then(|r| r.last_frame_time);
-                    let rev_activated = self.playback.reverse.as_ref().map(|r| r.activated).unwrap_or(false);
-                    // Reverse playhead is driven by decoded frame mapping to avoid double-advancing.
-                    let result = false;
-                    eprintln!("[REVERSE] should_advance={result} pending={has_pending} rev_activated={rev_activated} last_frame={rev_last_frame:?} playhead={:.3}", self.state.project.playback.playhead);
-                    let now_ms = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_millis() as u64)
-                        .unwrap_or(0);
-                    let prev_ms = REVERSE_ADVANCE_LOG_MS.load(Ordering::Relaxed);
-                    if now_ms.saturating_sub(prev_ms) >= 500 {
-                        REVERSE_ADVANCE_LOG_MS.store(now_ms, Ordering::Relaxed);
-                        // #region agent log
-                        crate::debug_log::emit(
-                            "H5",
-                            "crates/app/src/lib.rs:EditorApp::update",
-                            "reverse should_advance decision",
-                            &format!(
-                                "shouldAdvance={} pendingReverse={} reverseActivated={} reverseLastFrameTime={:?} playhead={:.3}",
-                                result,
-                                has_pending,
-                                rev_activated,
-                                rev_last_frame,
-                                self.state.project.playback.playhead
-                            ),
-                        );
-                        // #endregion
+                    let has_pending_rev = self.playback.pending_reverse.is_some();
+                    if has_pending_rev {
+                        false
+                    } else {
+                        self.playback
+                            .reverse
+                            .as_ref()
+                            .is_none_or(|r| r.last_frame_time.is_some())
                     }
-                    result
                 }
             };
             if should_advance {
                 let total_advance = dt + self.playhead_advance_debt_s;
                 let dt_for_advance = total_advance.min(PLAYHEAD_ADVANCE_MAX_DT_S);
-                let debt_before = total_advance - dt;
                 self.playhead_advance_debt_s =
                     (total_advance - dt_for_advance).min(PLAYHEAD_ADVANCE_DEBT_MAX_S);
-                let _ = dt_for_advance < total_advance
-                    && dt > UI_HITCH_LOG_THRESHOLD_S
-                    && debt_before >= 0.0;
-                self.state.project.playback.advance(dt_for_advance, duration);
+                self.state
+                    .project
+                    .playback
+                    .advance(dt_for_advance, duration);
             } else if self.state.project.playback.state == PlaybackState::Stopped {
                 self.playhead_advance_debt_s = 0.0;
             }
@@ -229,9 +192,6 @@ impl eframe::App for EditorApp {
         self.playback.manage_shadow_pipeline(&mut self.state, now);
         self.poll_import_tasks(ctx);
         self.poll_folder_watcher();
-        let pre_ui_ms = update_t0.elapsed().as_secs_f64() * 1000.0;
-
-        let ui_t0 = Instant::now();
         egui::TopBottomPanel::top("top_panel")
             .exact_height(28.0)
             .show(ctx, |ui| {
@@ -320,8 +280,6 @@ impl eframe::App for EditorApp {
                     }
                 });
         }
-        let ui_layout_ms = ui_t0.elapsed().as_secs_f64() * 1000.0;
-
         let is_playing = self.playback.is_playing(&self.state);
         if was_playing && !is_playing {
             self.playback.handle_playback_stop_transition();
@@ -331,11 +289,9 @@ impl eframe::App for EditorApp {
         self.playback.last_is_playing = is_playing;
         self.playback.last_playback_state = self.state.project.playback.state;
 
-        let poll_t0 = Instant::now();
-        let received = self
-            .playback
-            .poll_pipeline_frames(&mut self.state, &mut self.textures, ctx, now);
-        let poll_frames_ms = poll_t0.elapsed().as_secs_f64() * 1000.0;
+        let received =
+            self.playback
+                .poll_pipeline_frames(&mut self.state, &mut self.textures, ctx, now);
         if received {
             ctx.request_repaint();
         }
@@ -343,10 +299,5 @@ impl eframe::App for EditorApp {
         if self.state.project.playback.state != PlaybackState::Stopped {
             ctx.request_repaint();
         }
-
-        let total_update_ms = update_t0.elapsed().as_secs_f64() * 1000.0;
-        let _ = is_playing
-            && total_update_ms > UI_PROFILE_LOG_THRESHOLD_S * 1000.0
-            && (total_update_ms - pre_ui_ms - ui_layout_ms - poll_frames_ms).max(0.0) >= 0.0;
     }
 }

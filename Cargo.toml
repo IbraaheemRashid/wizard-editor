@@ -21,10 +21,11 @@ bytemuck = { version = "1", features = ["derive"] }
 uuid = { version = "1", features = ["v4"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-ffmpeg-the-third = "4"
 gstreamer = "0.24"
 gstreamer-app = "0.24"
 gstreamer-video = "0.24"
+gstreamer-pbutils = "0.24"
+gstreamer-audio = "0.24"
 ringbuf = "0.4"
 notify = { version = "7", default-features = false, features = ["macos_fsevent"] }
 

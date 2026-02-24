@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use crate::decoder::VideoDecoder;
+use crate::gst_pipeline::GstFrameDecoder;
 
 const THUMB_WIDTH: u32 = 480;
 const THUMB_HEIGHT: u32 = 270;
@@ -34,16 +34,16 @@ fn is_mostly_black(img: &image::RgbaImage) -> bool {
 }
 
 pub fn extract_thumbnail(path: &Path) -> Option<image::RgbaImage> {
-    let mut decoder = VideoDecoder::open(path).ok()?;
+    let mut decoder = GstFrameDecoder::open(path, THUMB_WIDTH, THUMB_HEIGHT).ok()?;
     let times = [0.5, 1.0, 2.0, 0.0, 0.04, 0.25, 5.0];
     for &t in &times {
-        if let Some(img) = decoder.seek_and_decode(t, THUMB_WIDTH, THUMB_HEIGHT) {
+        if let Some(img) = decoder.seek_and_decode(t) {
             if !is_mostly_black(&img) {
                 return Some(img);
             }
         }
     }
-    decoder.seek_and_decode(1.0, THUMB_WIDTH, THUMB_HEIGHT)
+    decoder.seek_and_decode(1.0)
 }
 
 pub fn extract_frames_streaming(
@@ -53,7 +53,7 @@ pub fn extract_frames_streaming(
     height: u32,
     sender: &std::sync::mpsc::Sender<(usize, f64, image::RgbaImage)>,
 ) {
-    let mut decoder = match VideoDecoder::open(path) {
+    let mut decoder = match GstFrameDecoder::open(path, width, height) {
         Ok(d) => d,
         Err(_) => return,
     };
@@ -76,7 +76,7 @@ pub fn extract_frames_streaming(
             break;
         }
 
-        let Some((img, pts)) = decoder.decode_next_frame_with_pts(width, height) else {
+        let Some((img, pts)) = decoder.decode_next_frame_with_pts() else {
             break;
         };
 

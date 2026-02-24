@@ -9,12 +9,37 @@ pub struct Selection {
     pub last_selected_clip: Option<ClipId>,
     pub hovered_clip: Option<ClipId>,
     pub selected_scrub_t: Option<f32>,
-    pub selected_timeline_clip: Option<TimelineClipId>,
+    pub selected_timeline_clips: HashSet<TimelineClipId>,
 }
 
 impl Selection {
     pub fn is_clip_selected(&self, id: ClipId) -> bool {
         self.selected_clips.contains(&id)
+    }
+
+    pub fn is_timeline_clip_selected(&self, id: TimelineClipId) -> bool {
+        self.selected_timeline_clips.contains(&id)
+    }
+
+    pub fn select_single_timeline_clip(&mut self, id: TimelineClipId) {
+        self.selected_timeline_clips.clear();
+        self.selected_timeline_clips.insert(id);
+    }
+
+    pub fn toggle_timeline_clip(&mut self, id: TimelineClipId) {
+        if self.selected_timeline_clips.contains(&id) {
+            self.selected_timeline_clips.remove(&id);
+        } else {
+            self.selected_timeline_clips.insert(id);
+        }
+    }
+
+    pub fn clear_timeline_clips(&mut self) {
+        self.selected_timeline_clips.clear();
+    }
+
+    pub fn primary_timeline_clip(&self) -> Option<TimelineClipId> {
+        self.selected_timeline_clips.iter().next().copied()
     }
 
     pub fn select_single(&mut self, id: ClipId) {

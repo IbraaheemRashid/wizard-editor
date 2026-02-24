@@ -3,6 +3,8 @@ use std::path::PathBuf;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
+use wizard_media::gst_pipeline::GstAudioDecoder;
+
 pub enum AudioPreviewRequest {
     Stop,
     Preview {
@@ -26,20 +28,17 @@ pub fn spawn_audio_worker(no_audio_paths: Arc<Mutex<HashSet<PathBuf>>>) -> Audio
     let (snippet_tx, snippet_rx) = mpsc::sync_channel(8);
 
     std::thread::spawn(move || {
-        let mut cached_decoder: Option<(PathBuf, wizard_media::decoder::AudioDecoder)> = None;
+        let mut cached_decoder: Option<(PathBuf, GstAudioDecoder)> = None;
 
         let open_decoder = |path: &std::path::Path,
                             no_audio: &Arc<Mutex<HashSet<PathBuf>>>|
-         -> Option<wizard_media::decoder::AudioDecoder> {
-            match wizard_media::decoder::AudioDecoder::open(path) {
+         -> Option<GstAudioDecoder> {
+            match GstAudioDecoder::open(path) {
                 Ok(d) => Some(d),
-                Err(_err) => {
-                    if let Ok(streams) = wizard_media::decoder::probe_streams(path) {
-                        let has_audio_stream = streams.iter().any(|s| s.medium == "Audio");
-                        if !has_audio_stream {
-                            if let Ok(mut set) = no_audio.lock() {
-                                set.insert(path.to_path_buf());
-                            }
+                Err(_) => {
+                    if !GstAudioDecoder::has_audio_stream(path) {
+                        if let Ok(mut set) = no_audio.lock() {
+                            set.insert(path.to_path_buf());
                         }
                     }
                     None
@@ -48,7 +47,7 @@ pub fn spawn_audio_worker(no_audio_paths: Arc<Mutex<HashSet<PathBuf>>>) -> Audio
         };
 
         let ensure_decoder =
-            |cached: &mut Option<(PathBuf, wizard_media::decoder::AudioDecoder)>,
+            |cached: &mut Option<(PathBuf, GstAudioDecoder)>,
              path: &std::path::Path,
              no_audio: &Arc<Mutex<HashSet<PathBuf>>>| {
                 let needs_new = cached.as_ref().is_none_or(|(p, _)| p != path);

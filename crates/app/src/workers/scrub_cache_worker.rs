@@ -1,6 +1,7 @@
 use std::collections::{HashSet, VecDeque};
 use std::sync::{mpsc, Arc, Mutex};
 
+use wizard_media::gst_pipeline::GstFrameDecoder;
 use wizard_state::clip::ClipId;
 
 use crate::constants::{
@@ -96,10 +97,11 @@ pub fn spawn_scrub_cache_worker() -> ScrubCacheWorkerChannels {
             };
 
             let duration = {
-                let decoder = match wizard_media::decoder::VideoDecoder::open(&path) {
-                    Ok(d) => d,
-                    Err(_) => continue,
-                };
+                let decoder =
+                    match GstFrameDecoder::open(&path, SCRUB_CACHE_WIDTH, SCRUB_CACHE_HEIGHT) {
+                        Ok(d) => d,
+                        Err(_) => continue,
+                    };
                 match decoder.duration_seconds() {
                     Some(d) if d > 0.0 => d,
                     _ => continue,

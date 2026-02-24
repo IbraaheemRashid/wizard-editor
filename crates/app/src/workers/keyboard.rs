@@ -34,9 +34,13 @@ pub fn handle_keyboard(ctx: &egui::Context, state: &mut AppState) {
             state.project.playback.toggle_play();
         }
         if i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace) {
-            if let Some(clip_id) = state.ui.selection.selected_timeline_clip.take() {
+            if !state.ui.selection.selected_timeline_clips.is_empty() {
                 state.project.snapshot_for_undo();
-                state.project.timeline.remove_clip(clip_id);
+                let to_delete: Vec<_> =
+                    state.ui.selection.selected_timeline_clips.drain().collect();
+                for clip_id in to_delete {
+                    state.project.timeline.remove_clip(clip_id);
+                }
             }
         }
         if i.modifiers.command && !i.modifiers.shift && i.key_pressed(egui::Key::Z) {

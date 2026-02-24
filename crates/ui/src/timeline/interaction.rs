@@ -96,63 +96,86 @@ pub fn handle_clip_drag_drop(
     pps: f32,
     scroll: f32,
 ) {
-    let Some(src_clip_id) = state.ui.timeline.dragging_clip else {
+    if state.ui.timeline.dragging_clips.is_empty() {
         return;
-    };
+    }
 
     let is_dragging = ui.input(|i| i.pointer.any_down());
     if is_dragging {
         return;
     }
 
-    let grab_offset = state.ui.timeline.drag_grab_offset.unwrap_or(0.0);
-    state.ui.timeline.dragging_clip = None;
-    state.ui.timeline.drag_grab_offset = None;
+    let dragging_clips = std::mem::take(&mut state.ui.timeline.dragging_clips);
+    let primary_clip = state.ui.timeline.drag_primary_clip.take();
+    let grab_offset = state.ui.timeline.drag_grab_offset.take().unwrap_or(0.0);
 
     let Some(pointer) = ui.input(|i| i.pointer.hover_pos()) else {
         return;
     };
 
-    let Some((src_track, _, _)) = state.project.timeline.find_clip(src_clip_id) else {
+    let Some(primary_id) = primary_clip else {
         return;
     };
-    let src_track_id = src_track.id;
 
-    let track_layouts = build_track_layout(state);
-    let total_tracks = track_layouts.len();
-    let dst_display_idx = ((pointer.y - tracks_top) / (TRACK_HEIGHT + 2.0))
-        .floor()
-        .max(0.0) as usize;
-    if dst_display_idx >= total_tracks {
+    let Some((_, _, primary_tc)) = state.project.timeline.find_clip(primary_id) else {
         return;
-    }
-    let dst_track_id = track_layouts[dst_display_idx].track_id;
-    let dst_kind = track_layouts[dst_display_idx].kind;
+    };
+    let original_start = primary_tc.timeline_start;
 
-    let src_kind = state.project.timeline.track_kind_for_clip(src_clip_id);
-    if let Some(sk) = src_kind {
-        if sk != dst_kind {
+    if dragging_clips.len() == 1 {
+        let src_clip_id = primary_id;
+        let Some((src_track, _, _)) = state.project.timeline.find_clip(src_clip_id) else {
+            return;
+        };
+        let src_track_id = src_track.id;
+
+        let track_layouts = build_track_layout(state);
+        let total_tracks = track_layouts.len();
+        let dst_display_idx = ((pointer.y - tracks_top) / (TRACK_HEIGHT + 2.0))
+            .floor()
+            .max(0.0) as usize;
+        if dst_display_idx >= total_tracks {
             return;
         }
-    }
+        let dst_track_id = track_layouts[dst_display_idx].track_id;
+        let dst_kind = track_layouts[dst_display_idx].kind;
 
-    let new_pos =
-        (((pointer.x - content_left + scroll) / pps).max(0.0) as f64 - grab_offset).max(0.0);
-    let (new_pos, _) = snap_time_to_clip_boundaries(state, new_pos, pps, Some(src_clip_id));
+        let src_kind = state.project.timeline.track_kind_for_clip(src_clip_id);
+        if let Some(sk) = src_kind {
+            if sk != dst_kind {
+                return;
+            }
+        }
 
-    state.project.snapshot_for_undo();
-    if src_track_id == dst_track_id {
-        state
-            .project
-            .timeline
-            .move_clip_on_track(src_track_id, src_clip_id, new_pos);
+        let new_pos =
+            (((pointer.x - content_left + scroll) / pps).max(0.0) as f64 - grab_offset).max(0.0);
+        let (new_pos, _) = snap_time_to_clip_boundaries(state, new_pos, pps, Some(src_clip_id));
+
+        state.project.snapshot_for_undo();
+        if src_track_id == dst_track_id {
+            state
+                .project
+                .timeline
+                .move_clip_on_track(src_track_id, src_clip_id, new_pos);
+        } else {
+            state
+                .project
+                .timeline
+                .move_clip_across_tracks(src_clip_id, dst_track_id, new_pos);
+        }
     } else {
+        let new_primary_pos =
+            (((pointer.x - content_left + scroll) / pps).max(0.0) as f64 - grab_offset).max(0.0);
+        let (new_primary_pos, _) =
+            snap_time_to_clip_boundaries(state, new_primary_pos, pps, Some(primary_id));
+        let delta = new_primary_pos - original_start;
+
+        state.project.snapshot_for_undo();
         state
             .project
             .timeline
-            .move_clip_across_tracks(src_clip_id, dst_track_id, new_pos);
+            .move_clips_by_delta(&dragging_clips, delta);
     }
-    state.ui.selection.selected_timeline_clip = None;
 }
 
 pub fn handle_zoom_scroll(

@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use std::sync::mpsc;
 use std::sync::Arc;
 
+use wizard_media::gst_pipeline::GstFrameDecoder;
 use wizard_state::clip::ClipId;
 
 pub const PLAYBACK_DECODE_WIDTH: u32 = 1920;
@@ -42,7 +43,7 @@ pub fn spawn_video_decode_worker() -> VideoDecodeWorkerChannels {
     let (result_tx, result_rx) = mpsc::channel::<VideoDecodeResult>();
 
     std::thread::spawn(move || {
-        let mut decoder_lru: VecDeque<(PathBuf, wizard_media::decoder::VideoDecoder)> =
+        let mut decoder_lru: VecDeque<(PathBuf, GstFrameDecoder)> =
             VecDeque::with_capacity(DECODER_LRU_CAPACITY);
         let mut last_emitted: Option<(ClipId, i64)> = None;
         let mut frame_cache: HashMap<(ClipId, i64), FrameCacheEntry> = HashMap::new();
@@ -64,7 +65,7 @@ pub fn spawn_video_decode_worker() -> VideoDecodeWorkerChannels {
                 }
                 0
             } else {
-                match wizard_media::decoder::VideoDecoder::open(&req.path) {
+                match GstFrameDecoder::open(&req.path, req.target_width, req.target_height) {
                     Ok(d) => {
                         if decoder_lru.len() >= DECODER_LRU_CAPACITY {
                             decoder_lru.pop_back();
@@ -100,14 +101,9 @@ pub fn spawn_video_decode_worker() -> VideoDecodeWorkerChannels {
             });
 
             let img = if can_sequential {
-                decoder.decode_next_frame(req.target_width, req.target_height)
+                decoder.decode_next_frame()
             } else {
-                decoder.seek_and_decode_limited(
-                    req.time_seconds,
-                    req.target_width,
-                    req.target_height,
-                    req.max_decode_frames,
-                )
+                decoder.seek_and_decode(req.time_seconds)
             };
 
             if let Some(img) = img {

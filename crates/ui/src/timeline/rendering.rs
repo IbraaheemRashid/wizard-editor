@@ -229,14 +229,14 @@ pub fn draw_drag_ghosts(
     let target_kind = track_layouts[target_display_idx].kind;
     let raw_drop_time = ((pointer.x - content_left + scroll) / pps).max(0.0) as f64;
 
-    let has_timeline_drag = state.ui.timeline.dragging_clip.is_some();
+    let has_timeline_drag = !state.ui.timeline.dragging_clips.is_empty();
     let grab_offset = state.ui.timeline.drag_grab_offset.unwrap_or(0.0);
     let unsnapped_drop_time = if has_timeline_drag {
         (raw_drop_time - grab_offset).max(0.0)
     } else {
         raw_drop_time
     };
-    let exclude_clip = state.ui.timeline.dragging_clip;
+    let exclude_clip = state.ui.timeline.drag_primary_clip;
     let (drop_time, _snapped) =
         snap_time_to_clip_boundaries(state, unsnapped_drop_time, pps, exclude_clip);
 
@@ -313,74 +313,52 @@ pub fn draw_drag_ghosts(
         }
     }
 
-    if let Some(src_clip_id) = state.ui.timeline.dragging_clip {
+    if has_timeline_drag {
         let is_dragging = ui.input(|i| i.pointer.any_down());
         if is_dragging {
-            if let Some((_, _, tc)) = state.project.timeline.find_clip(src_clip_id) {
-                let clip_id = tc.source_id;
-                let duration = tc.duration;
-                let linked_id = tc.linked_to;
-                let src_kind = state.project.timeline.track_kind_for_clip(src_clip_id);
-                let kind_mismatch = src_kind.is_some_and(|sk| sk != target_kind);
-                let clip_color = if kind_mismatch {
-                    Color32::from_rgba_unmultiplied(255, 80, 80, 120)
-                } else {
-                    match target_kind {
-                        TrackKind::Video => theme::CLIP_VIDEO,
-                        TrackKind::Audio => theme::CLIP_AUDIO,
-                    }
-                };
-                let track_y = tracks_top + target_display_idx as f32 * (TRACK_HEIGHT + 2.0);
-                draw_clip_ghost(
-                    ui,
-                    content_clip_rect,
-                    &ClipGhostParams {
-                        clip_id: &clip_id,
-                        duration,
-                        drop_time,
-                        track_y,
-                        content_left,
-                        pps,
-                        scroll,
-                        clip_color,
-                        track_kind: target_kind,
-                        tracks_top,
-                        num_tracks,
-                        state,
-                        textures,
-                    },
-                );
-                if let Some(lid) = linked_id {
-                    if let Some((linked_track, _, _)) = state.project.timeline.find_clip(lid) {
-                        let lt_id = linked_track.id;
-                        let lt_kind = linked_track.kind;
-                        if let Some(l_idx) = track_layouts.iter().position(|l| l.track_id == lt_id)
-                        {
-                            let linked_color = match lt_kind {
-                                TrackKind::Video => theme::CLIP_VIDEO,
-                                TrackKind::Audio => theme::CLIP_AUDIO,
-                            };
-                            let linked_y = tracks_top + l_idx as f32 * (TRACK_HEIGHT + 2.0);
-                            draw_clip_ghost(
-                                ui,
-                                content_clip_rect,
-                                &ClipGhostParams {
-                                    clip_id: &clip_id,
-                                    duration,
-                                    drop_time,
-                                    track_y: linked_y,
-                                    content_left,
-                                    pps,
-                                    scroll,
-                                    clip_color: linked_color,
-                                    track_kind: lt_kind,
-                                    tracks_top,
-                                    num_tracks,
-                                    state,
-                                    textures,
-                                },
-                            );
-                        }
+            let primary_id = state.ui.timeline.drag_primary_clip;
+            let primary_start = primary_id
+                .and_then(|id| state.project.timeline.find_clip(id))
+                .map(|(_, _, tc)| tc.timeline_start)
+                .unwrap_or(0.0);
+            let delta = drop_time - primary_start;
+
+            let dragging: Vec<_> = state.ui.timeline.dragging_clips.iter().copied().collect();
+            for src_clip_id in dragging {
+                if let Some((_, _, tc)) = state.project.timeline.find_clip(src_clip_id) {
+                    let clip_id = tc.source_id;
+                    let duration = tc.duration;
+                    let clip_drop_time = (tc.timeline_start + delta).max(0.0);
+                    let tc_track_id = tc.track_id;
+
+                    if let Some(l_idx) =
+                        track_layouts.iter().position(|l| l.track_id == tc_track_id)
+                    {
+                        let tk = track_layouts[l_idx].kind;
+                        let clip_color = match tk {
+                            TrackKind::Video => theme::CLIP_VIDEO,
+                            TrackKind::Audio => theme::CLIP_AUDIO,
+                        };
+                        let track_y = tracks_top + l_idx as f32 * (TRACK_HEIGHT + 2.0);
+                        draw_clip_ghost(
+                            ui,
+                            content_clip_rect,
+                            &ClipGhostParams {
+                                clip_id: &clip_id,
+                                duration,
+                                drop_time: clip_drop_time,
+                                track_y,
+                                content_left,
+                                pps,
+                                scroll,
+                                clip_color,
+                                track_kind: tk,
+                                tracks_top,
+                                num_tracks,
+                                state,
+                                textures,
+                            },
+                        );
                     }
                 }
             }

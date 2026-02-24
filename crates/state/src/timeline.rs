@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use crate::clip::ClipId;
 use uuid::Uuid;
 
@@ -398,6 +400,43 @@ impl Timeline {
             let linked_track = self.find_clip(linked_id).map(|(t, _, _)| t.id);
             if let Some(lt_id) = linked_track {
                 self.move_clip_on_track_core(lt_id, linked_id, new_position);
+            }
+        }
+    }
+
+    pub fn move_clips_by_delta(&mut self, clips: &HashSet<TimelineClipId>, delta: f64) {
+        let mut all_ids: HashSet<TimelineClipId> = HashSet::new();
+        for &cid in clips {
+            all_ids.insert(cid);
+            if let Some((_, _, tc)) = self.find_clip(cid) {
+                if let Some(linked) = tc.linked_to {
+                    all_ids.insert(linked);
+                }
+            }
+        }
+
+        let mut removed: Vec<(TrackId, TimelineClip)> = Vec::new();
+        for track in self.all_tracks_mut() {
+            let mut i = 0;
+            while i < track.clips.len() {
+                if all_ids.contains(&track.clips[i].id) {
+                    let mut clip = track.clips.remove(i);
+                    let track_id = track.id;
+                    clip.timeline_start = (clip.timeline_start + delta).max(0.0);
+                    removed.push((track_id, clip));
+                } else {
+                    i += 1;
+                }
+            }
+        }
+
+        for (track_id, clip) in removed {
+            if let Some(track) = self.track_by_id_mut(track_id) {
+                track.resolve_overlaps(clip.timeline_start, clip.timeline_start + clip.duration);
+                track.clips.push(clip);
+                track
+                    .clips
+                    .sort_by(|a, b| a.timeline_start.total_cmp(&b.timeline_start));
             }
         }
     }

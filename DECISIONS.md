@@ -68,152 +68,125 @@ Every significant technical choice in Wizard Editor, what we picked, what we did
 
 ## Video Decoding
 
-### FFmpeg bindings (ffmpeg-the-third) over shelling out to ffmpeg binary
+### GStreamer pipeline model over direct FFmpeg bindings
 
-**What we chose:** Direct Rust bindings to libavformat/libavcodec via the `ffmpeg-the-third` crate.
+**What we chose:** GStreamer via `gstreamer-rs` 0.24 — a pipeline-based media framework where decoding is described as a declarative graph.
 
-**What we considered:**
+**What we started with:** Direct Rust bindings to libavformat/libavcodec via `ffmpeg-the-third`. This worked but was migrated to GStreamer.
 
-| | Library bindings | Shell out to ffmpeg |
+**Why we migrated:**
+
+| | FFmpeg bindings (original) | GStreamer (current) |
 |---|---|---|
-| Per-frame overhead | ~0ms (function call) | 10-50ms (process spawn + pipe) |
-| Frame pipelining | Decode → scale → deliver in one call | Pipe raw bytes, parse manually |
-| Error handling | Typed Result<T, Error> | Parse stderr strings |
-| Seeking | Native seek with keyframe index | `-ss` flag, approximate |
-| Memory | Zero-copy frame access | Full frame through pipe |
+| Pipeline setup | Manual: open container, find streams, configure decoder, create scaler, manage threads | Declarative: `filesrc → decodebin → appsink` — framework handles demux/decode/scale |
+| Codec negotiation | Manual stream iteration, codec parameter extraction | `decodebin` auto-detects and selects optimal decoder |
+| Scaling/conversion | Manual `scaling::Context` with cache management | `videoconvert` + `videoscale` elements in pipeline |
+| Seeking | Manual keyframe index, PTS tracking, stagnant-PTS detection | `seek` event with flags — framework handles keyframe alignment |
+| Hardware decode | Manual VideoToolbox setup | Drop-in plugin (`vtdec`) via `decodebin` auto-selection |
+| Dependency | Direct C library linkage | Plugin system — codecs via `gst-libav` (FFmpeg through GStreamer) |
+| Speed control | Manual StreamClock with wall-time pacing | `seek` event with rate parameter |
 
-**Why bindings win:** At 60fps, each frame has 16.6ms. Shelling out to ffmpeg per frame costs 10-50ms in process creation alone — impossible to sustain. The bindings give us direct access to the decoder state, scaler context caching, and PTS tracking.
+**The decisive factor:** Maintenance burden. With `ffmpeg-the-third`, we had ~200 lines of scaler context caching, ~100 lines of PTS stagnation detection, ~80 lines of stream discovery — all of which GStreamer handles internally. The migration removed this code and replaced it with pipeline construction (~50 lines per pipeline type).
 
-**The cost:** `ffmpeg-the-third` adds a compile-time dependency on FFmpeg's C libraries. The user needs `brew install ffmpeg` (or equivalent). This is acceptable because FFmpeg is the only production-quality option for supporting 30+ video codecs.
+**What GStreamer handles that we used to do manually:**
+- Scaler context caching (GStreamer's `videoscale` element manages this internally)
+- Codec parameter extraction (GStreamer's `decodebin` auto-negotiates)
+- Audio resampling configuration (`audioresample` element)
+- Hardware decoder selection (`decodebin` prefers hardware decoders when available)
 
-**Why not GStreamer:** GStreamer provides a pipeline-based media framework that handles demuxing, decoding, and output in a declarative graph. The tradeoffs:
+**What we still do manually with GStreamer:**
+- Reverse playback: short-lived pipelines per GOP window, decode all frames, reverse order, pace with `ReverseStreamClock`
+- PTS offset calibration: first-frame mapping from source timestamps to timeline coordinates
+- Bridge threading: pull from `appsink` on bridge threads, push to channels/ring buffers for main thread
+- Audio ring buffer management: GStreamer decodes to `appsink`, bridge thread pushes samples to `ringbuf`
 
-| | FFmpeg bindings | GStreamer |
-|---|---|---|
-| Control | Frame-level: seek, decode, scale, convert | Pipeline-level: describe graph, framework executes |
-| Reverse playback | We implement GOP-window decode ourselves | Would need custom element or reverse-playback plugin |
-| PTS mapping | Direct access to decoder timestamps | Abstracted behind pad events |
-| Dependency weight | libavformat/libavcodec (~20MB) | Full GStreamer stack (~150MB+) |
-| Rust bindings | Mature (ffmpeg-the-third) | gstreamer-rs exists but heavier |
+**The tradeoff:** GStreamer adds ~150MB of dependencies (vs ~20MB for raw FFmpeg libs). For a desktop video editor, this is acceptable. The plugin architecture means codec support improves with GStreamer updates without recompiling our code.
 
-We needed frame-level control for: reverse playback (decode GOP windows, reverse order), PTS offset calibration (first-frame mapping), and variable-speed decode with StreamClock pacing. GStreamer's pipeline model abstracts away the exact control points we need. For a simple "play video forward at 1x," GStreamer would be simpler. For an editor with J/K/L speed control, reverse playback, and shadow pipelines — FFmpeg bindings give us the control we need.
+**The cost of the pipeline model:** Less direct control. With FFmpeg bindings, we could call `decoder.decode(packet)` and inspect the raw frame. With GStreamer, we describe a graph and pull from sinks. For the editor's needs (forward/reverse playback, scrubbing, shadow pipelines), this is sufficient — we just construct different pipeline topologies for each use case.
 
 ---
 
-### Scaler context caching
+### Seek strategy with GStreamer
 
-**Problem:** FFmpeg's `scaling::Context` takes 1-2ms to construct. At 60fps, that's 6-12% of our budget wasted on a context we'll use identically next frame.
+**The problem:** Seeking in video files requires landing on a keyframe, then decoding forward to the target time. GStreamer handles the keyframe alignment internally via `seek` events, but we still need to manage the seeking lifecycle for our different use cases.
 
-**Solution:** Cache the scaler and check 5 parameters before rebuilding:
+**GStreamer seeking model:**
+- `GstFrameDecoder`: Uses `preroll_and_seek()` — set pipeline to Paused, send seek event, pull frame from appsink. GStreamer handles keyframe alignment and forward decode internally.
+- `GstPipelineHandle` (forward playback): Seek event with `Flush` flag, then transition to Playing state. GStreamer's internal buffering handles the decode-forward-to-target automatically.
+- `GstReversePipelineHandle`: Constructs a short-lived pipeline per GOP window, decodes all frames in range, reverses order.
 
-```
-ScalerState { ctx, src_w, src_h, src_fmt, out_width, out_height }
-```
+**What GStreamer simplified:** We no longer track stagnant PTS manually or count decode frames. GStreamer's seek infrastructure handles corrupt containers more gracefully than our previous 180-frame loop with stagnation detection.
 
-Only rebuild when resolution or pixel format changes (rare — typically once per clip). Saves 1-2ms every single frame during playback. 50 lines of cache management code pays for itself in microseconds.
-
-**What we didn't do:** Pre-compute all needed scalers (we don't know output resolutions ahead of time) or use GPU scaling (Metal compute shader — possible but adds complexity for marginal gain since CPU scaling at 1920x1080 is already <2ms).
-
----
-
-### Seek strategy: 180-frame budget with stagnant PTS detection
-
-**The problem:** After seeking in an MPEG container, the decoder often lands on a keyframe before our target. We need to decode forward until we reach the target time. But some files have corrupted PTS that never advances — the decoder claims every frame is at t=0.
-
-**Our solution:**
-1. Loop up to 180 frames (3 seconds at 60fps) after seek
-2. Track PTS of each frame
-3. If PTS doesn't advance for 4 consecutive frames (diff < 1μs), bail — the file is broken
-4. Return best frame seen so far
-
-**Why 180:** Long enough to decode through a typical GOP (1-2 seconds) after a keyframe seek. Short enough that a pathological file doesn't freeze the UI for more than ~200ms on a background thread.
-
-**What we didn't do:**
-- Fixed timeout (200ms) — hardware speed varies, this would be flaky
-- Unlimited decode — a corrupt file would freeze forever
-- Keyframe-only seeking — too imprecise for scrubbing, misses exact frame
+**What we still guard against:** Pipeline startup timeouts, seek failures (returns error on unsupported containers), and appsink EOS (end-of-stream) detection for clips shorter than expected.
 
 ---
 
 ## Playback Pipeline
 
-### 3-thread architecture (demuxer → video decoder → audio decoder)
+### GStreamer pipeline + bridge thread architecture
 
 ```
-┌──────────┐        ┌──────────────┐        ┌──────────────┐
-│ Demuxer  │──128──►│ Video Decode │──16───►│ Main Thread  │
-│ thread   │  pkts  │ + scale      │ frames │ try_recv()   │
-│          │        │ + StreamClock│        │              │
-│          │──128──►│              │        │              │
-│          │  pkts  │ Audio Decode │──ring─►│ AudioMixer   │
-└──────────┘        │ + resample   │  buf   │              │
-                    └──────────────┘        └──────────────┘
+┌──────────────────────┐        ┌──────────────┐
+│ GStreamer Pipeline    │        │ Main Thread   │
+│ (internal threads)    │        │ try_recv()    │
+│                       │        │               │
+│ filesrc → decodebin → │        │               │
+│  ├─ videoconvert ─────┤──mpsc─►│               │
+│  │  + videoscale      │        │               │
+│  │  + appsink         │        │               │
+│  └─ audioconvert ─────┤──ring─►│ AudioMixer    │
+│     + audioresample   │  buf   │               │
+│     + appsink         │        │               │
+└──────────────────────┘        └──────────────┘
 ```
 
-**Why three threads, not one or two:**
+**Why GStreamer manages its own threading:**
 
 | Design | Pros | Cons |
 |--------|------|------|
 | Single thread (decode on main) | Simple | 2-20ms decode blocks frame, fails 60fps |
-| Two threads (demux+decode, audio) | Fewer threads | Demuxer I/O stalls block video decode |
-| Three threads (chosen) | Each stage runs at its own pace | 3 threads × 512KB stack = 1.5MB |
-| Thread-per-frame (tokio) | Maximum parallelism | Overkill, 500μs spawn overhead per frame |
+| Manual 3-thread (original FFmpeg approach) | Full control over each stage | ~380 lines of thread management code |
+| GStreamer pipeline + bridge threads (current) | Framework manages demux/decode threading; we manage only the bridge to main thread | Less direct control over decode scheduling |
 
-The key insight: demuxing (file I/O), video decoding (CPU compute), and audio decoding (CPU compute + resampling) are independent stages with different latency profiles. Separating them means a 5ms I/O stall in the demuxer doesn't delay the video decoder that's still processing buffered packets.
-
----
-
-### sync_channel capacities: 128 packets, 16 frames
-
-**Packet buffer (128):**
-- At a typical bitrate, 128 packets ≈ 1-2 seconds of media
-- Large enough to absorb demuxer I/O hiccups without the video decoder starving
-- Small enough that seeking doesn't drain 10 seconds of stale packets
-
-**Frame buffer (16):**
-- 16 decoded frames ≈ 267ms at 60fps
-- Provides backpressure: if the main thread stalls (UI freeze), the decoder stops at 16 buffered frames instead of consuming unlimited memory
-- Small enough that seek response is fast (drain 16 frames, not 1000)
-
-**What we didn't do:** Unbounded channels (memory leak on pause — decoder fills queue forever) or tiny buffers (4 frames — one UI hiccup starves the decoder).
+The key insight: GStreamer internally runs demuxing and decoding on separate threads within its pipeline. We don't need to manage that concurrency — we only need bridge threads that pull from `appsink` elements and forward data to the main thread via channels (video) or ring buffers (audio). This reduced our threading code substantially while maintaining the same 60fps guarantee: the main thread still only calls `try_recv()`, never blocking.
 
 ---
 
-### StreamClock: wall-time pacing
+### Bridge thread buffering
 
-**The problem:** Video decoders output frames as fast as they can. Without pacing, a 30fps clip would play at 300fps.
+**The model:** GStreamer handles internal buffering between demuxer and decoder. Our bridge threads (one for video, one for audio) pull from `appsink` elements and forward to the main thread.
 
-**Our solution:** StreamClock records `(wall_start_time, start_pts)` when playback begins. For each decoded frame:
+**Video bridge:** Pulls `GstSample` from appsink, extracts PTS and RGBA data, sends `DecodedFrame` via `mpsc::channel`. The channel is unbounded because GStreamer's own pipeline pacing (via its internal clock) limits the production rate. If the main thread falls behind, frames queue — but GStreamer won't produce faster than real-time during playback.
 
-```
-target_wall_time = (frame_pts - start_pts) / speed
-elapsed = now - wall_start_time
-diff = target_wall_time - elapsed
-if diff > 1ms: sleep(diff)
-```
+**Audio bridge:** Pulls `GstBuffer` from audio appsink, pushes samples to `ringbuf::HeapProd<f32>`. The ring buffer provides natural backpressure — when full, the bridge thread blocks on `push_slice`, which slows the GStreamer pipeline automatically.
 
-**Why wall-time, not frame counting:** Frame counting assumes constant frame rate. Real video has variable frame duration (23.976fps interlaced, variable bitrate, B-frames). Wall-time pacing naturally handles all of these — just compare PTS to real elapsed time.
+**Why not pull directly from appsink on the main thread:** `appsink.pull_sample()` can block if no sample is ready. Any blocking on the main thread breaks the 16.6ms frame budget. Bridge threads absorb this latency; the main thread only calls `try_recv()`.
 
-**Speed changes:** When the user presses L (faster), we don't restart the clock. Instead, `set_speed()` snapshots the current PTS position and rebases from there. Smooth transition, no frame drop.
+---
 
-**What we didn't do:**
-- Audio-driven sync (audio thread leads, video follows) — standard in media players but requires PLL logic we'd need to tune per-codec
-- Frame-drop pacing (skip frames if behind) — creates visible judder
-- V-sync locked (one frame per display refresh) — doesn't work for non-60fps content
+### Playback pacing: GStreamer clock vs manual StreamClock
+
+**Forward playback:** GStreamer's internal pipeline clock handles frame pacing when in `Playing` state. For variable-speed playback (J/K/L controls), we use GStreamer's `seek` event with a `rate` parameter. A 2x seek event tells GStreamer to deliver frames at twice the normal rate. Speed changes are applied via a new seek event — GStreamer handles the rebasing internally.
+
+**Reverse playback:** GStreamer's reverse-rate seeking (`rate = -1.0`) works for some containers but is unreliable for others. Instead, we use `ReverseStreamClock` — a manual wall-time pacer that delivers reverse-decoded frames at the correct rate. This is the one area where we still manage timing ourselves rather than delegating to GStreamer.
+
+**Why we kept manual pacing for reverse:** GStreamer's reverse playback support varies by container format. H.264 in MP4 works well; MPEG-TS and some MKV files produce out-of-order frames or stall. Our GOP-window approach (seek backward, decode forward, reverse order, pace manually) is more reliable across formats.
 
 ---
 
 ### Shadow pipeline: prefetch next clip
 
-**The problem:** Starting a new decoder takes 100-400ms (open file, parse container, find first keyframe, decode). If we wait until the playhead crosses the clip boundary, the user sees a blank frame for up to 400ms.
+**The problem:** Starting a new GStreamer pipeline takes 100-400ms (create elements, link pads, preroll to Paused state, seek to start position). If we wait until the playhead crosses the clip boundary, the user sees a blank frame for up to 400ms.
 
-**Our solution:** When the playhead is within 2 seconds of a clip boundary (adjusted for speed), spawn a shadow pipeline for the next clip in the background. When the boundary is reached:
+**Our solution:** When the playhead is within 3 seconds of a clip boundary (adjusted for speed), spawn a shadow pipeline for the next clip in the background. When the boundary is reached:
 
 1. Shadow has already decoded its first frame (buffered)
 2. Shadow audio sources are already running
 3. Promote shadow to primary — zero visible gap
 
-**Why 2 seconds:** Empirically, decoder startup on Apple Silicon M-series takes 50-200ms for H.264 and 100-400ms for HEVC. 2 seconds gives ~10x headroom. Too short (0.5s) risks the shadow not being ready. Too long (5s) wastes threads on clips the user might never reach (they could stop playback, seek away, etc.).
+**Why 3 seconds:** Empirically, GStreamer pipeline startup on Apple Silicon M-series takes 50-200ms for H.264 and 100-400ms for HEVC (including element creation, pad negotiation, and preroll). 3 seconds gives ~10x headroom. Too short (0.5s) risks the shadow not being ready. Too long (5s) wastes threads on clips the user might never reach.
+
+**File prewarming:** Before spawning the shadow pipeline, we call `prewarm_file()` on a background thread — reads the first 16MB of the file to warm the OS page cache. This reduces the I/O component of pipeline startup from 50-100ms to <5ms on subsequent access.
 
 **What we didn't do:**
 - Pre-decode all clips (memory explosion with long timelines)
@@ -260,7 +233,7 @@ All subsequent frames are mapped: `timeline_pos = frame.pts - pts_offset`. This 
 
 **What we didn't do:**
 - Full file decode to memory (a 1-hour 4K clip = ~1.8TB of RGBA frames)
-- FFmpeg reverse filter (`-vf reverse` — requires reading entire file, not streamable)
+- GStreamer reverse-rate seek (`rate = -1.0`) — unreliable across container formats, some files produce out-of-order frames
 - Frame cache LRU for backward playback (works for short scrubs but not sustained reverse at 4x speed)
 
 ---
@@ -275,11 +248,13 @@ All subsequent frames are mapped: `timeline_pos = frame.pts - pts_offset`. This 
 | Minor stall | 80ms | Pause clock, keep last frame on screen | Prevents playhead advancing past where we have frames |
 | Frame gap | 120ms | Request fallback single-frame decode | Video decode worker can serve a frame in ~20-50ms |
 | Long stall | 250ms | Preserve existing texture (don't overwrite with fallback) | If pipeline is recovering, don't clobber with lower-quality fallback |
-| Stale pipeline | 750ms | Destroy and restart entire pipeline | Something is fundamentally broken, fresh start is cheaper than debugging |
+| Stale pipeline | 750ms | Destroy and restart entire GStreamer pipeline | Something is fundamentally broken, fresh start is cheaper than debugging |
 
-**Why graduated, not binary:** A single "is it stalled?" check creates oscillation — the pipeline keeps getting killed and restarted during temporary I/O hiccups. The graduated approach lets minor hiccups resolve themselves (minor stall → resume) while escalating genuine failures (stale pipeline → restart).
+**Why graduated, not binary:** A single "is it stalled?" check creates oscillation — the GStreamer pipeline keeps getting killed and restarted during temporary I/O hiccups. The graduated approach lets minor hiccups resolve themselves (minor stall → resume) while escalating genuine failures (stale pipeline → restart).
 
 **The specific numbers** were tuned empirically on Apple Silicon with H.264 and HEVC files. They represent "what felt responsive without causing thrashing."
+
+**GStreamer-specific recovery:** When destroying a stale pipeline, we set the GStreamer pipeline state to `Null` (which releases all resources), then construct a fresh pipeline from scratch. GStreamer's state transitions (`Null → Ready → Paused → Playing`) handle cleanup deterministically — no leaked file handles or orphaned decoder threads.
 
 ---
 
@@ -374,7 +349,7 @@ rodio would work for "play this WAV file" but not for "mix 3 audio clips at 2x s
 - Random sampling — non-deterministic, different thumbnail every time
 - Always use frame 0 — almost always black or a logo
 
-**Cost:** 7 seeks × 15ms average = ~100ms per clip. Runs on background thread, invisible to UI.
+**Cost:** 7 seeks × 15ms average = ~100ms per clip. Uses `GstFrameDecoder` which constructs a short-lived GStreamer pipeline per seek. Runs on background thread, invisible to UI.
 
 ---
 
@@ -446,7 +421,7 @@ rodio would work for "play this WAV file" but not for "mix 3 audio clips at 2x s
 
 ---
 
-### Pre-computed peaks (512 buckets) vs real-time FFT
+### Pre-computed peaks (512 buckets) via GStreamer decode vs real-time FFT
 
 | | Pre-computed peaks (chosen) | Real-time FFT |
 |---|---|---|
@@ -455,7 +430,7 @@ rodio would work for "play this WAV file" but not for "mix 3 audio clips at 2x s
 | Memory | 512 × 8 bytes = 4KB per clip | None stored |
 | Accuracy at high zoom | Fixed resolution (may look blocky) | Perfect at any zoom |
 
-**Why pre-computed:** At import time, we decode the entire audio file to mono samples, divide into 512 equal chunks, and store (min, max) per chunk. Timeline rendering is just: given the visible time range, slice the peaks array and draw. Zero computation per frame.
+**Why pre-computed:** At import time, we decode the entire audio file to mono F32LE samples via a GStreamer pipeline (`filesrc → decodebin → audioconvert → audioresample → appsink`), divide into 512 equal chunks, and store (min, max) per chunk. Timeline rendering is just: given the visible time range, slice the peaks array and draw. Zero computation per frame.
 
 **Why 512 buckets:** At typical zoom levels (20-500 pixels/second), a 30-second clip occupies 600-15,000 pixels. 512 buckets give ~1 peak per pixel at medium zoom. At extreme zoom-in, peaks get wider (bars instead of lines) — visually acceptable. At extreme zoom-out, multiple peaks merge — also fine.
 

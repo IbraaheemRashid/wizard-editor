@@ -140,17 +140,9 @@ pub fn timeline_panel(ui: &mut egui::Ui, state: &mut AppState, textures: &dyn Te
             let tc_id = tc.id;
             let tc_source_id = tc.source_id;
 
-            let is_selected = state
-                .ui
-                .selection
-                .selected_timeline_clip
-                .is_some_and(|id| id == tc_id);
+            let is_selected = state.ui.selection.is_timeline_clip_selected(tc_id);
 
-            let is_being_dragged = state
-                .ui
-                .timeline
-                .dragging_clip
-                .is_some_and(|id| id == tc_id);
+            let is_being_dragged = state.ui.timeline.dragging_clips.contains(&tc_id);
 
             let mut drew_gpu_waveform = false;
 
@@ -321,7 +313,7 @@ pub fn timeline_panel(ui: &mut egui::Ui, state: &mut AppState, textures: &dyn Te
 
             if (hover_on_left || hover_on_right)
                 && state.ui.timeline.trimming_clip.is_none()
-                && state.ui.timeline.dragging_clip.is_none()
+                && state.ui.timeline.dragging_clips.is_empty()
             {
                 ui.ctx().set_cursor_icon(CursorIcon::ResizeHorizontal);
             }
@@ -359,13 +351,28 @@ pub fn timeline_panel(ui: &mut egui::Ui, state: &mut AppState, textures: &dyn Te
                     let grab_time = ((origin.x - content_left + scroll) / pps).max(0.0) as f64;
                     let grab_offset = grab_time - tc.timeline_start;
                     state.ui.timeline.drag_grab_offset = Some(grab_offset);
-                    state.ui.timeline.dragging_clip = Some(tc_id);
+                    if state.ui.selection.is_timeline_clip_selected(tc_id)
+                        && state.ui.selection.selected_timeline_clips.len() > 1
+                    {
+                        state.ui.timeline.dragging_clips =
+                            state.ui.selection.selected_timeline_clips.clone();
+                    } else {
+                        state.ui.selection.select_single_timeline_clip(tc_id);
+                        state.ui.timeline.dragging_clips =
+                            [tc_id].into_iter().collect();
+                    }
+                    state.ui.timeline.drag_primary_clip = Some(tc_id);
                 }
             }
 
             if clip_response.clicked() && state.ui.timeline.trimming_clip.is_none() {
-                state.ui.selection.selected_timeline_clip = Some(tc_id);
-                state.ui.selection.select_single(tc_source_id);
+                let cmd_held = ui.input(|i| i.modifiers.command);
+                if cmd_held {
+                    state.ui.selection.toggle_timeline_clip(tc_id);
+                } else {
+                    state.ui.selection.select_single_timeline_clip(tc_id);
+                    state.ui.selection.select_single(tc_source_id);
+                }
             }
 
             let is_starred = state.project.starred.contains(&tc_source_id);
@@ -375,25 +382,19 @@ pub fn timeline_panel(ui: &mut egui::Ui, state: &mut AppState, textures: &dyn Te
                     if ui.button("Delete").clicked() {
                         state.project.snapshot_for_undo();
                         state.project.timeline.remove_clip_single(tc_id);
-                        if state.ui.selection.selected_timeline_clip == Some(tc_id) {
-                            state.ui.selection.selected_timeline_clip = None;
-                        }
+                        state.ui.selection.selected_timeline_clips.remove(&tc_id);
                         ui.close_menu();
                     }
                     if ui.button("Delete Both").clicked() {
                         state.project.snapshot_for_undo();
                         state.project.timeline.remove_clip(tc_id);
-                        if state.ui.selection.selected_timeline_clip == Some(tc_id) {
-                            state.ui.selection.selected_timeline_clip = None;
-                        }
+                        state.ui.selection.selected_timeline_clips.remove(&tc_id);
                         ui.close_menu();
                     }
                 } else if ui.button("Delete").clicked() {
                     state.project.snapshot_for_undo();
                     state.project.timeline.remove_clip_single(tc_id);
-                    if state.ui.selection.selected_timeline_clip == Some(tc_id) {
-                        state.ui.selection.selected_timeline_clip = None;
-                    }
+                    state.ui.selection.selected_timeline_clips.remove(&tc_id);
                     ui.close_menu();
                 }
                 let star_label = if is_starred { "Unstar" } else { "Star" };
