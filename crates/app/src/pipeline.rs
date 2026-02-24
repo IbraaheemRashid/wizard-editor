@@ -2,12 +2,13 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 
 use wizard_media::gst_pipeline::{GstAudioOnlyHandle, GstPipelineHandle, GstReversePipelineHandle};
-use wizard_media::pipeline::DecodedFrame;
+use wizard_media::pipeline::{DecodedFrame, ReversePipelineHandle as CpuReversePipelineHandle};
 use wizard_state::clip::ClipId;
 use wizard_state::timeline::TimelineClipId;
 
 use crate::audio_mixer::AudioMixer;
 use crate::constants::*;
+use crate::debug_log;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum PipelineStatus {
@@ -68,8 +69,43 @@ pub struct ShadowPipelineState {
     pub audio_sources: Vec<(GstAudioOnlyHandle, wizard_audio::output::AudioConsumer)>,
 }
 
+pub enum ReversePipelineHandle {
+    Gst(GstReversePipelineHandle),
+    Cpu(CpuReversePipelineHandle),
+}
+
+impl ReversePipelineHandle {
+    pub fn is_first_frame_ready(&self) -> bool {
+        match self {
+            ReversePipelineHandle::Gst(handle) => handle.is_first_frame_ready(),
+            ReversePipelineHandle::Cpu(_) => true,
+        }
+    }
+
+    pub fn begin_playing(&self) -> Result<(), String> {
+        match self {
+            ReversePipelineHandle::Gst(handle) => handle.begin_playing(),
+            ReversePipelineHandle::Cpu(_) => Ok(()),
+        }
+    }
+
+    pub fn try_recv_frame(&self) -> Option<DecodedFrame> {
+        match self {
+            ReversePipelineHandle::Gst(handle) => handle.try_recv_frame(),
+            ReversePipelineHandle::Cpu(handle) => handle.try_recv_frame(),
+        }
+    }
+
+    pub fn update_speed(&self, speed: f64) {
+        match self {
+            ReversePipelineHandle::Gst(handle) => handle.update_speed(speed),
+            ReversePipelineHandle::Cpu(handle) => handle.update_speed(speed),
+        }
+    }
+}
+
 pub struct ReversePipelineState {
-    pub handle: GstReversePipelineHandle,
+    pub handle: ReversePipelineHandle,
     pub clip: (ClipId, PathBuf),
     pub timeline_clip: TimelineClipId,
     pub pts_offset: Option<f64>,
@@ -104,6 +140,89 @@ pub struct PendingPipeline {
     pub timeline_clip: TimelineClipId,
     pub speed: f64,
     pub started_at: f64,
+}
+
+pub struct PendingReversePipeline {
+    pub rx: mpsc::Receiver<Result<ReversePipelineHandle, String>>,
+    pub clip: (ClipId, PathBuf),
+    pub timeline_clip: TimelineClipId,
+    pub speed: f64,
+    pub started_at: f64,
+}
+
+impl PendingReversePipeline {
+    fn should_use_cpu_reverse(path: &Path) -> bool {
+        path.extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.to_ascii_lowercase())
+            .is_some_and(|ext| matches!(ext.as_str(), "mp4" | "mov" | "m4v" | "mpg" | "mpeg"))
+    }
+
+    pub fn spawn(
+        path: &Path,
+        source_time: f64,
+        target_w: u32,
+        target_h: u32,
+        speed: f64,
+        clip_id: ClipId,
+        timeline_clip_id: TimelineClipId,
+        now: f64,
+    ) -> Self {
+        let (tx, rx) = mpsc::channel();
+        let path_buf = path.to_path_buf();
+        std::thread::Builder::new()
+            .name("reverse-pipeline-spawn".into())
+            .spawn(move || {
+                let use_cpu = Self::should_use_cpu_reverse(&path_buf);
+                // #region agent log
+                debug_log::emit(
+                    "H1",
+                    "crates/app/src/pipeline.rs:PendingReversePipeline::spawn",
+                    "reverse backend selected",
+                    &format!(
+                        "path={} extension={} backend={} sourceTime={:.3} speed={:.3}",
+                        path_buf.display(),
+                        path_buf.extension().and_then(|e| e.to_str()).unwrap_or(""),
+                        if use_cpu { "cpu" } else { "gst" },
+                        source_time,
+                        speed
+                    ),
+                );
+                // #endregion
+                let result = if use_cpu {
+                    CpuReversePipelineHandle::start(
+                        &path_buf,
+                        source_time,
+                        speed,
+                        target_w,
+                        target_h,
+                    )
+                    .map(ReversePipelineHandle::Cpu)
+                } else {
+                    GstReversePipelineHandle::start(
+                        &path_buf,
+                        source_time,
+                        speed,
+                        target_w,
+                        target_h,
+                    )
+                    .map(ReversePipelineHandle::Gst)
+                };
+                let _ = tx.send(result);
+            })
+            .expect("failed to spawn reverse-pipeline-spawn thread");
+        Self {
+            rx,
+            clip: (clip_id, path.to_path_buf()),
+            timeline_clip: timeline_clip_id,
+            speed,
+            started_at: now,
+        }
+    }
+
+    pub fn try_recv(&self) -> Option<Result<ReversePipelineHandle, String>> {
+        self.rx.try_recv().ok()
+    }
 }
 
 pub struct ShadowAudioSourceRequest {

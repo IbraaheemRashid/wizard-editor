@@ -1,9 +1,10 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use wizard_audio::output::{AudioOutput, AudioProducer};
-use wizard_media::gst_pipeline::{GstAudioOnlyHandle, GstReversePipelineHandle};
+use wizard_media::gst_pipeline::GstAudioOnlyHandle;
 use wizard_media::pipeline::DecodedFrame;
 use wizard_state::clip::ClipId;
 use wizard_state::playback::PlaybackState;
@@ -12,9 +13,11 @@ use wizard_state::timeline::TimelineClipId;
 
 use crate::audio_mixer::AudioMixer;
 use crate::constants::*;
+use crate::debug_log;
 use crate::pipeline::{
-    ForwardPipelineState, PendingPipeline, PendingShadowPipeline, PipelineStatus,
-    ReversePipelineState, ShadowAudioSourceRequest, ShadowPipelineState,
+    ForwardPipelineState, PendingPipeline, PendingReversePipeline, PendingShadowPipeline,
+    PipelineStatus, ReversePipelineHandle as ReverseHandleKind, ReversePipelineState,
+    ShadowAudioSourceRequest, ShadowPipelineState,
 };
 use crate::texture_cache::TextureCache;
 use crate::workers;
@@ -27,6 +30,7 @@ pub struct PlaybackEngine {
     pub shadow: Option<ShadowPipelineState>,
     pub pending_shadow: Option<PendingShadowPipeline>,
     pub reverse: Option<ReversePipelineState>,
+    pub pending_reverse: Option<PendingReversePipeline>,
 
     pub audio_output: Option<AudioOutput>,
     pub audio_producer: Arc<Mutex<AudioProducer>>,
@@ -51,6 +55,24 @@ pub struct PlaybackEngine {
     pub runtime_log_frames: u32,
 }
 
+static REVERSE_NO_FRAME_LOG_MS: AtomicU64 = AtomicU64::new(0);
+static REVERSE_MAP_LOG_MS: AtomicU64 = AtomicU64::new(0);
+static REVERSE_BOUNDARY_LOG_MS: AtomicU64 = AtomicU64::new(0);
+const CPU_REVERSE_STARTUP_TIMEOUT_S: f64 = 1.5;
+
+fn should_emit_throttled(last_ms: &AtomicU64, interval_ms: u64) -> bool {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let prev = last_ms.load(Ordering::Relaxed);
+    if now_ms.saturating_sub(prev) < interval_ms {
+        return false;
+    }
+    last_ms.store(now_ms, Ordering::Relaxed);
+    true
+}
+
 impl PlaybackEngine {
     pub fn new(
         audio_output: Option<AudioOutput>,
@@ -69,6 +91,7 @@ impl PlaybackEngine {
             shadow: None,
             pending_shadow: None,
             reverse: None,
+            pending_reverse: None,
             audio_output,
             audio_producer,
             mixer,
@@ -132,6 +155,7 @@ impl PlaybackEngine {
         self.shadow = None;
         self.pending_shadow = None;
         self.pending_forward = None;
+        self.pending_reverse = None;
         self.reset_audio_sources();
     }
 
@@ -149,6 +173,7 @@ impl PlaybackEngine {
             self.forward = None;
             self.pending_forward = None;
             self.reverse = None;
+            self.pending_reverse = None;
             self.shadow = None;
             self.pending_shadow = None;
             self.handle_playback_stop_transition();
@@ -255,10 +280,6 @@ impl PlaybackEngine {
             });
         }
 
-        eprintln!(
-            "[SHADOW] spawn queued clip={next_timeline_clip_id:?} audio_sources={}",
-            audio_requests.len()
-        );
         self.pending_shadow = Some(PendingShadowPipeline::spawn(
             &path,
             next_hit.source_time,
@@ -286,14 +307,10 @@ impl PlaybackEngine {
         };
 
         let pending = self.pending_shadow.take().expect("checked above");
-        let wait_ms = (now - pending.started_at) * 1000.0;
+        let _ = now - pending.started_at;
 
         match result {
             Ok(build) => {
-                eprintln!(
-                    "[SHADOW] pipeline arrived after {wait_ms:.1}ms, audio_sources={}",
-                    build.audio_sources.len()
-                );
                 self.shadow = Some(ShadowPipelineState {
                     handle: build.handle,
                     clip: pending.clip,
@@ -389,18 +406,26 @@ impl PlaybackEngine {
         true
     }
 
-    pub fn try_activate_pipeline(&mut self) {
+    pub fn try_activate_pipeline(&mut self, now: f64) {
         if let Some(ref mut fwd) = self.forward {
             if !fwd.activated && fwd.handle.is_first_frame_ready() {
                 fwd.activated = true;
-                eprintln!("[ACTIVATE] forward pipeline -> Playing");
                 let _ = fwd.handle.begin_playing();
             }
         }
         if let Some(ref mut rev) = self.reverse {
-            if !rev.activated && rev.handle.is_first_frame_ready() {
-                rev.activated = true;
-                let _ = rev.handle.begin_playing();
+            if !rev.activated {
+                let ready = rev.handle.is_first_frame_ready();
+                let force_activate = !ready && (now - rev.started_at) >= REVERSE_FORCE_PLAYING_AFTER_S;
+                eprintln!(
+                    "[REVERSE] try_activate: first_frame_ready={ready} force_activate={force_activate} activated={}",
+                    rev.activated
+                );
+                if ready || force_activate {
+                    rev.activated = true;
+                    let result = rev.handle.begin_playing();
+                    eprintln!("[REVERSE] begin_playing result: {result:?}");
+                }
             }
         }
     }
@@ -412,7 +437,7 @@ impl PlaybackEngine {
         now: f64,
         _ctx: &egui::Context,
     ) {
-        self.try_activate_pipeline();
+        self.try_activate_pipeline(now);
 
         let is_forward = state.project.playback.state == PlaybackState::Playing;
         let is_reverse = state.project.playback.state == PlaybackState::PlayingReverse;
@@ -425,8 +450,9 @@ impl PlaybackEngine {
             self.pending_shadow = None;
         }
 
-        if !is_reverse && self.reverse.is_some() {
+        if !is_reverse && (self.reverse.is_some() || self.pending_reverse.is_some()) {
             self.reverse = None;
+            self.pending_reverse = None;
         }
 
         if !is_playing {
@@ -524,12 +550,6 @@ impl PlaybackEngine {
             let has_stale_pipeline =
                 last_frame_time.is_some_and(|t| (now - t) > STALE_PIPELINE_THRESHOLD_S);
             if self.forward.is_some() && has_stale_pipeline && !needs_new_pipeline {
-                eprintln!(
-                    "[MANAGE] STALE pipeline restart! last_frame_time={:?} now={now:.3} gap={:.3}s playhead={:.3}",
-                    last_frame_time,
-                    last_frame_time.map(|t| now - t).unwrap_or(0.0),
-                    state.project.playback.playhead
-                );
                 self.forward = None;
                 self.pending_forward = None;
                 self.shadow = None;
@@ -549,10 +569,6 @@ impl PlaybackEngine {
             }
 
             if scrub_just_released || needs_new_pipeline {
-                eprintln!(
-                    "[MANAGE] pipeline restart: scrub_released={scrub_just_released} needs_new={needs_new_pipeline} playhead={:.3}",
-                    state.project.playback.playhead
-                );
                 self.forward = None;
                 self.pending_forward = None;
                 self.shadow = None;
@@ -603,55 +619,70 @@ impl PlaybackEngine {
     ) {
         let speed = state.project.playback.speed;
 
-        if let Some(ref rev) = self.reverse {
-            if speed != rev.speed {
+        if let Some(ref mut rev) = self.reverse {
+            if (speed - rev.speed).abs() > 0.01 {
                 rev.handle.update_speed(speed);
+                rev.speed = speed;
             }
         }
 
-        let needs_new = if let Some(ref rev) = self.reverse {
-            rev.timeline_clip != timeline_clip_id || rev.clip.0 != clip_id || rev.clip.1 != *path
-        } else {
-            true
-        };
+        let pending_matches = self
+            .pending_reverse
+            .as_ref()
+            .is_some_and(|p| p.timeline_clip == timeline_clip_id && p.clip.0 == clip_id);
 
+        let mut reverse_is_stuck = false;
+        let needs_new = !pending_matches
+            && match self.reverse.as_ref() {
+                None => true,
+                Some(rev) => {
+                    let startup_timeout_s = match rev.handle {
+                        ReverseHandleKind::Cpu(_) => CPU_REVERSE_STARTUP_TIMEOUT_S,
+                        ReverseHandleKind::Gst(_) => REVERSE_STARTUP_TIMEOUT_S,
+                    };
+                    reverse_is_stuck = rev.last_frame_time.is_none()
+                        && now - rev.started_at > startup_timeout_s;
+                    rev.timeline_clip != timeline_clip_id
+                        || rev.clip.0 != clip_id
+                        || rev.clip.1 != *path
+                        || reverse_is_stuck
+                }
+            };
+
+        eprintln!("[REVERSE] manage: needs_new={needs_new} pending_matches={pending_matches} has_reverse={} clip={clip_id:?}", self.reverse.is_some());
         if needs_new {
+            // #region agent log
+            debug_log::emit(
+                "H4",
+                "crates/app/src/playback_engine.rs:manage_reverse_pipeline",
+                "reverse pipeline requested",
+                &format!(
+                    "needsNew={} pendingMatches={} hasReverse={} reverseIsStuck={} clipId={:?} timelineClipId={:?} sourceTime={:.3} speed={:.3}",
+                    needs_new,
+                    pending_matches,
+                    self.reverse.is_some(),
+                    reverse_is_stuck,
+                    clip_id,
+                    timeline_clip_id,
+                    source_time,
+                    speed
+                ),
+            );
+            // #endregion
             self.reverse = None;
-            match GstReversePipelineHandle::start(
+            self.pending_reverse = None;
+            eprintln!("[REVERSE] spawning new pipeline for clip {clip_id:?} at source_time={source_time:.3}");
+            self.pending_reverse = Some(PendingReversePipeline::spawn(
                 path,
                 source_time,
-                speed,
                 workers::video_decode_worker::PLAYBACK_DECODE_WIDTH,
                 workers::video_decode_worker::PLAYBACK_DECODE_HEIGHT,
-            ) {
-                Ok(handle) => {
-                    self.reverse = Some(ReversePipelineState {
-                        handle,
-                        clip: (clip_id, path.to_path_buf()),
-                        timeline_clip: timeline_clip_id,
-                        pts_offset: None,
-                        speed,
-                        activated: false,
-                        started_at: now,
-                        last_frame_time: None,
-                    });
-                    for _ in 0..50 {
-                        if self
-                            .reverse
-                            .as_ref()
-                            .is_some_and(|r| r.handle.is_first_frame_ready())
-                        {
-                            break;
-                        }
-                        std::thread::sleep(std::time::Duration::from_micros(100));
-                    }
-                    self.try_activate_pipeline();
-                    self.show_scrub_cache_bridge_frame(textures, clip_id, source_time);
-                }
-                Err(e) => {
-                    eprintln!("Failed to start reverse pipeline: {e}");
-                }
-            }
+                speed,
+                clip_id,
+                timeline_clip_id,
+                now,
+            ));
+            self.show_scrub_cache_bridge_frame(textures, clip_id, source_time);
         }
     }
 
@@ -708,14 +739,11 @@ impl PlaybackEngine {
         };
 
         let pending = self.pending_forward.take().expect("checked above");
-        let wait_ms = (now - pending.started_at) * 1000.0;
+        let _ = now - pending.started_at;
 
         match result {
             Ok(handle) => {
-                let first_ready = handle.is_first_frame_ready();
-                eprintln!(
-                    "[PENDING] pipeline arrived after {wait_ms:.1}ms, first_frame_ready={first_ready}"
-                );
+                let _ = handle.is_first_frame_ready();
                 self.runtime_log_frames = 0;
                 self.forward = Some(ForwardPipelineState {
                     handle,
@@ -729,10 +757,67 @@ impl PlaybackEngine {
                     last_frame_time: None,
                     age: 0,
                 });
-                self.try_activate_pipeline();
+                self.try_activate_pipeline(now);
             }
             Err(e) => {
                 eprintln!("Failed to start pipeline: {e}");
+            }
+        }
+    }
+
+    pub fn poll_pending_reverse_pipeline(&mut self, now: f64) {
+        let pending = match self.pending_reverse.as_ref() {
+            Some(p) => p,
+            None => return,
+        };
+
+        let result = match pending.try_recv() {
+            Some(r) => r,
+            None => return,
+        };
+
+        let pending = self.pending_reverse.take().expect("checked above");
+        let wait_ms = (now - pending.started_at) * 1000.0;
+
+        match result {
+            Ok(handle) => {
+                eprintln!("[REVERSE] pipeline arrived after {wait_ms:.1}ms");
+                // #region agent log
+                debug_log::emit(
+                    "H2",
+                    "crates/app/src/playback_engine.rs:poll_pending_reverse_pipeline",
+                    "reverse pipeline ready",
+                    &format!(
+                        "waitMs={:.1} clipId={:?} timelineClipId={:?} speed={:.3}",
+                        wait_ms,
+                        pending.clip.0,
+                        pending.timeline_clip,
+                        pending.speed
+                    ),
+                );
+                // #endregion
+                self.reverse = Some(ReversePipelineState {
+                    handle,
+                    clip: pending.clip,
+                    timeline_clip: pending.timeline_clip,
+                    pts_offset: None,
+                    speed: pending.speed,
+                    activated: false,
+                    started_at: pending.started_at,
+                    last_frame_time: None,
+                });
+                self.try_activate_pipeline(now);
+            }
+            Err(e) => {
+                eprintln!("Failed to start reverse pipeline: {e}");
+                // #region agent log
+                debug_log::emit(
+                    "H2",
+                    "crates/app/src/playback_engine.rs:poll_pending_reverse_pipeline",
+                    "reverse pipeline failed to start",
+                    &format!("waitMs={:.1} error={}", wait_ms, e),
+                );
+                // #endregion
             }
         }
     }
@@ -907,6 +992,7 @@ impl PlaybackEngine {
                     offset
                 } else {
                     let offset = frame.pts_seconds - expected_source_at_playhead;
+                    eprintln!("[REVERSE] first frame: pts={:.3} expected={:.3} offset={:.3} src_in={:.3} src_out={:.3}", frame.pts_seconds, expected_source_at_playhead, offset, tc.source_in, tc.source_out);
                     rev.pts_offset = Some(offset);
                     offset
                 };
@@ -914,49 +1000,205 @@ impl PlaybackEngine {
 
                 if mapped_source_pts >= tc.source_in && mapped_source_pts < tc.source_out {
                     let timeline_pos = tc.timeline_start + (mapped_source_pts - tc.source_in);
-                    if previous_rev_pts.is_none() || timeline_pos <= state.project.playback.playhead
+                    eprintln!("[REVERSE] playhead -> {timeline_pos:.3} (mapped_pts={mapped_source_pts:.3})");
+                    let distance_to_clip_start = (mapped_source_pts - tc.source_in).max(0.0);
+                    if distance_to_clip_start <= 0.12
+                        && should_emit_throttled(&REVERSE_BOUNDARY_LOG_MS, 150)
                     {
+                        // #region agent log
+                        debug_log::emit(
+                            "H6",
+                            "crates/app/src/playback_engine.rs:apply_reverse_pipeline_frame",
+                            "reverse near clip start but still in-range",
+                            &format!(
+                                "mappedSourcePts={:.3} sourceIn={:.3} sourceOut={:.3} distanceToStart={:.3} timelinePos={:.3} playhead={:.3} clip={:?}",
+                                mapped_source_pts,
+                                tc.source_in,
+                                tc.source_out,
+                                distance_to_clip_start,
+                                timeline_pos,
+                                state.project.playback.playhead,
+                                rev.timeline_clip
+                            ),
+                        );
+                        // #endregion
+                    }
+                    let should_apply =
+                        previous_rev_pts.is_none() || timeline_pos <= state.project.playback.playhead;
+                    if should_emit_throttled(&REVERSE_MAP_LOG_MS, 250) {
+                        // #region agent log
+                        debug_log::emit(
+                            "H3",
+                            "crates/app/src/playback_engine.rs:apply_reverse_pipeline_frame",
+                            "reverse frame mapped to timeline",
+                            &format!(
+                                "framePts={:.3} mappedSourcePts={:.3} timelinePos={:.3} currentPlayhead={:.3} ptsOffset={:.3} hadPreviousRevPts={} shouldApply={}",
+                                frame.pts_seconds,
+                                mapped_source_pts,
+                                timeline_pos,
+                                state.project.playback.playhead,
+                                pts_offset,
+                                previous_rev_pts.is_some(),
+                                should_apply
+                            ),
+                        );
+                        // #endregion
+                    }
+                    if should_apply {
                         state.project.playback.playhead = timeline_pos;
                     }
-                } else if mapped_source_pts < tc.source_in {
-                    let prev_time = (tc.timeline_start - 0.001).max(0.0);
-                    state.project.playback.playhead = prev_time;
-                    self.reverse = None;
-                    self.reset_audio_sources();
+                    if distance_to_clip_start <= 0.12 && previous_rev_pts.is_some() {
+                        let from_timeline_clip = rev.timeline_clip;
+                        let prev_time = (tc.timeline_start - 0.001).max(0.0);
+                        state.project.playback.playhead = prev_time;
+                        self.reverse = None;
+                        self.reset_audio_sources();
 
-                    if prev_time > 0.0 {
-                        if let Some(prev_hit) = state.project.timeline.video_clip_at_time(prev_time)
-                        {
-                            let prev_clip_id = prev_hit.clip.source_id;
-                            let prev_timeline_clip_id = prev_hit.clip.id;
-                            if let Some(clip) = state.project.clips.get(&prev_clip_id) {
-                                let path = clip.path.clone();
-                                let speed = state.project.playback.speed;
-                                if let Ok(handle) = GstReversePipelineHandle::start(
-                                    &path,
-                                    prev_hit.source_time,
-                                    speed,
-                                    workers::video_decode_worker::PLAYBACK_DECODE_WIDTH,
-                                    workers::video_decode_worker::PLAYBACK_DECODE_HEIGHT,
-                                ) {
-                                    self.reverse = Some(ReversePipelineState {
-                                        handle,
-                                        clip: (prev_clip_id, path),
-                                        timeline_clip: prev_timeline_clip_id,
-                                        pts_offset: None,
+                        // #region agent log
+                        debug_log::emit(
+                            "H7",
+                            "crates/app/src/playback_engine.rs:apply_reverse_pipeline_frame",
+                            "reverse transitioned from near-start in-range frame",
+                            &format!(
+                                "fromTimelineClip={:?} distanceToStart={:.3} prevTime={:.3}",
+                                from_timeline_clip, distance_to_clip_start, prev_time
+                            ),
+                        );
+                        // #endregion
+
+                        if prev_time > 0.0 {
+                            if let Some(prev_hit) = state
+                                .project
+                                .timeline
+                                .previous_clip_before(from_timeline_clip)
+                            {
+                                let prev_clip_id = prev_hit.clip.source_id;
+                                let prev_timeline_clip_id = prev_hit.clip.id;
+                                if let Some(clip) = state.project.clips.get(&prev_clip_id) {
+                                    let path = clip.path.clone();
+                                    let speed = state.project.playback.speed;
+                                    self.pending_reverse = Some(PendingReversePipeline::spawn(
+                                        &path,
+                                        prev_hit.source_time,
+                                        workers::video_decode_worker::PLAYBACK_DECODE_WIDTH,
+                                        workers::video_decode_worker::PLAYBACK_DECODE_HEIGHT,
                                         speed,
-                                        activated: false,
-                                        started_at: now,
-                                        last_frame_time: None,
-                                    });
+                                        prev_clip_id,
+                                        prev_timeline_clip_id,
+                                        now,
+                                    ));
                                     self.show_scrub_cache_bridge_frame(
                                         textures,
                                         prev_clip_id,
                                         prev_hit.source_time,
                                     );
                                 }
+                            } else {
+                                // #region agent log
+                                debug_log::emit(
+                                    "H7",
+                                    "crates/app/src/playback_engine.rs:apply_reverse_pipeline_frame",
+                                    "reverse near-start transition failed: no previous clip",
+                                    &format!(
+                                        "fromTimelineClip={:?} distanceToStart={:.3} prevTime={:.3}",
+                                        from_timeline_clip, distance_to_clip_start, prev_time
+                                    ),
+                                );
+                                // #endregion
                             }
                         }
+                        return false;
+                    }
+                } else if mapped_source_pts < tc.source_in {
+                    eprintln!("[REVERSE] mapped_pts={mapped_source_pts:.3} < source_in={:.3} — clip transition", tc.source_in);
+                    let from_timeline_clip = rev.timeline_clip;
+                    // #region agent log
+                    debug_log::emit(
+                        "H3",
+                        "crates/app/src/playback_engine.rs:apply_reverse_pipeline_frame",
+                        "reverse frame below source range, transitioning to previous clip",
+                        &format!(
+                            "framePts={:.3} mappedSourcePts={:.3} sourceIn={:.3} timelineStart={:.3}",
+                            frame.pts_seconds,
+                            mapped_source_pts,
+                            tc.source_in,
+                            tc.timeline_start
+                        ),
+                    );
+                    // #endregion
+                    let prev_time = (tc.timeline_start - 0.001).max(0.0);
+                    state.project.playback.playhead = prev_time;
+                    self.reverse = None;
+                    self.reset_audio_sources();
+
+                    if prev_time > 0.0 {
+                        if let Some(prev_hit) = state
+                            .project
+                            .timeline
+                            .previous_clip_before(from_timeline_clip)
+                        {
+                            let prev_clip_id = prev_hit.clip.source_id;
+                            let prev_timeline_clip_id = prev_hit.clip.id;
+                            if let Some(clip) = state.project.clips.get(&prev_clip_id) {
+                                let path = clip.path.clone();
+                                let speed = state.project.playback.speed;
+                                self.pending_reverse = Some(PendingReversePipeline::spawn(
+                                    &path,
+                                    prev_hit.source_time,
+                                    workers::video_decode_worker::PLAYBACK_DECODE_WIDTH,
+                                    workers::video_decode_worker::PLAYBACK_DECODE_HEIGHT,
+                                    speed,
+                                    prev_clip_id,
+                                    prev_timeline_clip_id,
+                                    now,
+                                ));
+                                self.show_scrub_cache_bridge_frame(
+                                    textures,
+                                    prev_clip_id,
+                                    prev_hit.source_time,
+                                );
+                                // #region agent log
+                                debug_log::emit(
+                                    "H7",
+                                    "crates/app/src/playback_engine.rs:apply_reverse_pipeline_frame",
+                                    "reverse transitioned to previous clip",
+                                    &format!(
+                                        "fromTimelineClip={:?} prevTime={:.3} toTimelineClip={:?} toSourceTime={:.3}",
+                                        from_timeline_clip,
+                                        prev_time,
+                                        prev_timeline_clip_id,
+                                        prev_hit.source_time
+                                    ),
+                                );
+                                // #endregion
+                            }
+                        } else {
+                            // #region agent log
+                            debug_log::emit(
+                                "H7",
+                                "crates/app/src/playback_engine.rs:apply_reverse_pipeline_frame",
+                                "reverse transition failed: no previous hit at boundary time",
+                                &format!(
+                                    "fromTimelineClip={:?} prevTime={:.3}",
+                                    from_timeline_clip,
+                                    prev_time
+                                ),
+                            );
+                            // #endregion
+                        }
+                    } else {
+                        // #region agent log
+                        debug_log::emit(
+                            "H7",
+                            "crates/app/src/playback_engine.rs:apply_reverse_pipeline_frame",
+                            "reverse reached absolute timeline start",
+                            &format!(
+                                "fromTimelineClip={:?} prevTime={:.3}",
+                                from_timeline_clip,
+                                prev_time
+                            ),
+                        );
+                        // #endregion
                     }
                     return false;
                 }
@@ -1174,8 +1416,28 @@ impl PlaybackEngine {
             while let Some(frame) = rev.handle.try_recv_frame() {
                 reverse_frames.push(frame);
             }
+            if reverse_frames.is_empty() && rev.activated {
+                eprintln!("[REVERSE] activated but no frames this tick (last_frame_time={:?})", rev.last_frame_time);
+                if should_emit_throttled(&REVERSE_NO_FRAME_LOG_MS, 500) {
+                    // #region agent log
+                    debug_log::emit(
+                        "H2",
+                        "crates/app/src/playback_engine.rs:poll_pipeline_frames",
+                        "reverse activated but delivered no frames",
+                        &format!(
+                            "lastFrameTime={:?} startedAt={:.3} status={:?} isActivated={}",
+                            rev.last_frame_time,
+                            rev.started_at,
+                            rev.status(now),
+                            rev.activated
+                        ),
+                    );
+                    // #endregion
+                }
+            }
         }
         if !reverse_frames.is_empty() {
+            eprintln!("[REVERSE] {} frame(s) received, pts={:.3}", reverse_frames.len(), reverse_frames[0].pts_seconds);
             received = true;
             let best_idx = self.pick_best_reverse_frame_for_playhead(state, &reverse_frames);
             let frame = &reverse_frames[best_idx];

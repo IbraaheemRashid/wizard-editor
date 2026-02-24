@@ -609,6 +609,34 @@ impl Timeline {
         self.video_clip_at_time(next_time)
     }
 
+    pub fn previous_clip_before(&self, id: TimelineClipId) -> Option<PlayheadHit> {
+        let (_, _, current) = self.find_clip(id)?;
+        let current_start = current.timeline_start;
+        let mut best: Option<PlayheadHit> = None;
+        let mut best_end = f64::NEG_INFINITY;
+
+        for track in &self.video_tracks {
+            if !track.visible {
+                continue;
+            }
+            for tc in &track.clips {
+                let end = tc.timeline_start + tc.duration;
+                if end <= current_start && end > best_end {
+                    let sample_t = (end - 0.001).max(tc.timeline_start);
+                    let source_time = tc.source_in + (sample_t - tc.timeline_start);
+                    best_end = end;
+                    best = Some(PlayheadHit {
+                        track_id: track.id,
+                        clip: tc.clone(),
+                        source_time,
+                    });
+                }
+            }
+        }
+
+        best
+    }
+
     pub fn time_remaining_in_clip(&self, id: TimelineClipId, playhead: f64) -> Option<f64> {
         let (_, _, tc) = self.find_clip(id)?;
         let clip_end = tc.timeline_start + tc.duration;

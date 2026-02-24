@@ -575,16 +575,9 @@ pub fn timeline_panel(ui: &mut egui::Ui, state: &mut AppState, textures: &dyn Te
             let raw_t = ((pointer.x - content_left + scroll) / pps).max(0.0) as f64;
             let (t, snapped) = snap_time_to_clip_boundaries(state, raw_t, pps, None);
 
-            let previous_playhead = state.project.playback.playhead;
             state.project.playback.playhead = t;
             if scrub_response.dragged() || scrub_response.clicked() {
                 state.ui.timeline.scrubbing = Some(t);
-            }
-            if scrub_response.clicked() {
-                eprintln!(
-                    "[SEEK-DEBUG] ruler click prev={previous_playhead:.3} next={t:.3} state={:?}",
-                    state.project.playback.state
-                );
             }
             playhead_x = content_left + t as f32 * pps - scroll;
 

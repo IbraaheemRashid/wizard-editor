@@ -233,30 +233,15 @@ fn spawn_demuxer(
     std::thread::Builder::new()
         .name("pipeline-demuxer".into())
         .spawn(move || {
-            let t0 = Instant::now();
             let Ok(mut format_ctx) = ffmpeg::format::input(&path) else {
                 return;
             };
-            let debug = cfg!(debug_assertions) || std::env::var("DEBUG_PLAYBACK").is_ok();
-            if debug {
-                eprintln!(
-                    "[DBG:demux] file opened, {:.1}ms",
-                    t0.elapsed().as_secs_f64() * 1000.0
-                );
-            }
 
             if start_time_seconds > 0.01 {
                 let ts = (start_time_seconds * 1_000_000.0) as i64;
                 let _ = format_ctx.seek(ts, ..);
-                if debug {
-                    eprintln!(
-                        "[DBG:demux] seeked to {start_time_seconds:.3}s, {:.1}ms",
-                        t0.elapsed().as_secs_f64() * 1000.0
-                    );
-                }
             }
 
-            let mut first_packet = true;
             loop {
                 match stop_rx.try_recv() {
                     Ok(_) | Err(mpsc::TryRecvError::Disconnected) => return,
@@ -268,14 +253,6 @@ fn spawn_demuxer(
                     Ok(_) => {}
                     Err(ffmpeg::Error::Eof) => return,
                     Err(_) => return,
-                }
-
-                if debug && first_packet {
-                    eprintln!(
-                        "[DBG:demux] first packet read, {:.1}ms",
-                        t0.elapsed().as_secs_f64() * 1000.0
-                    );
-                    first_packet = false;
                 }
 
                 let stream_idx = packet.stream();
@@ -310,8 +287,6 @@ fn spawn_video_decoder(
     std::thread::Builder::new()
         .name("pipeline-video".into())
         .spawn(move || {
-            let t0 = Instant::now();
-            let debug = cfg!(debug_assertions) || std::env::var("DEBUG_PLAYBACK").is_ok();
             let Ok(format_ctx) = ffmpeg::format::input(&path) else {
                 return;
             };
@@ -327,21 +302,12 @@ fn spawn_video_decoder(
             let Ok(mut decoder) = codec_ctx.decoder().video() else {
                 return;
             };
-            if debug {
-                eprintln!(
-                    "[DBG:vdec] codec ready, {:.1}ms",
-                    t0.elapsed().as_secs_f64() * 1000.0
-                );
-            }
 
             let mut scaler: Option<(scaling::Context, u32, u32, Pixel, u32, u32)> = None;
             let mut decoded_frame = VideoFrame::empty();
             let mut skipping = skip_before > 0.01;
             let mut buf_pool: Vec<Vec<u8>> = Vec::with_capacity(8);
             let mut clock = StreamClock::new(speed);
-            let mut first_packet_logged = false;
-            let mut first_frame_logged = false;
-            let mut first_send_logged = false;
 
             let reclaim_buffers = |pool: &mut Vec<Vec<u8>>, rx: &mpsc::Receiver<Vec<u8>>| {
                 while let Ok(buf) = rx.try_recv() {
@@ -358,9 +324,7 @@ fn spawn_video_decoder(
                 |frame: &VideoFrame,
                  scaler: &mut Option<(scaling::Context, u32, u32, Pixel, u32, u32)>,
                  skipping: &mut bool,
-                 buf_pool: &mut Vec<Vec<u8>>,
-                 first_frame_logged: &mut bool,
-                 first_send_logged: &mut bool|
+                 buf_pool: &mut Vec<Vec<u8>>|
                  -> bool {
                     let pts = frame.pts().map(|p| p as f64 * time_base).unwrap_or(0.0);
 
@@ -370,14 +334,6 @@ fn spawn_video_decoder(
                         }
                         *skipping = false;
                         clock.reset(pts);
-                    }
-
-                    if debug && !*first_frame_logged {
-                        eprintln!(
-                            "[DBG:vdec] first frame decoded (not skipped), pts={pts:.3}, {:.1}ms",
-                            t0.elapsed().as_secs_f64() * 1000.0
-                        );
-                        *first_frame_logged = true;
                     }
 
                     while let Ok(s) = speed_rx.try_recv() {
@@ -390,12 +346,6 @@ fn spawn_video_decoder(
                     if let Some((w, h)) =
                         convert_video_frame(frame, scaler, target_w, target_h, &mut buf)
                     {
-                        if debug && !*first_send_logged {
-                            eprintln!(
-                                "[DBG:vdec] first frame scaled, {:.1}ms",
-                                t0.elapsed().as_secs_f64() * 1000.0
-                            );
-                        }
                         let delay = clock.delay(pts);
                         if !delay.is_zero() {
                             std::thread::sleep(delay);
@@ -408,13 +358,6 @@ fn spawn_video_decoder(
                                 rgba_data: buf,
                             })
                             .is_ok();
-                        if debug && !*first_send_logged {
-                            eprintln!(
-                                "[DBG:vdec] first frame sent to channel, {:.1}ms",
-                                t0.elapsed().as_secs_f64() * 1000.0
-                            );
-                            *first_send_logged = true;
-                        }
                         ok
                     } else {
                         if buf_pool.len() < 8 {
@@ -433,22 +376,12 @@ fn spawn_video_decoder(
                             &mut scaler,
                             &mut skipping,
                             &mut buf_pool,
-                            &mut first_frame_logged,
-                            &mut first_send_logged,
                         ) {
                             return;
                         }
                     }
                     return;
                 };
-
-                if debug && !first_packet_logged {
-                    eprintln!(
-                        "[DBG:vdec] first packet recv, {:.1}ms",
-                        t0.elapsed().as_secs_f64() * 1000.0
-                    );
-                    first_packet_logged = true;
-                }
 
                 if decoder.send_packet(&packet).is_err() {
                     continue;
@@ -460,8 +393,6 @@ fn spawn_video_decoder(
                         &mut scaler,
                         &mut skipping,
                         &mut buf_pool,
-                        &mut first_frame_logged,
-                        &mut first_send_logged,
                     ) {
                         return;
                     }

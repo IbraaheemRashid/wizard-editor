@@ -5489,6 +5489,7 @@ dependencies = [
  "image",
  "notify",
  "ringbuf",
+ "serde_json",
  "wizard-audio",
  "wizard-media",
  "wizard-state",

@@ -50,12 +50,7 @@ fn prewarm_file_sync(path: &Path) {
                 Err(_) => break,
             }
         }
-        let ms = t0.elapsed().as_secs_f64() * 1000.0;
-        eprintln!(
-            "[GST-PREWARM] read {:.1}MB in {ms:.1}ms for {}",
-            total as f64 / (1024.0 * 1024.0),
-            path.file_name().unwrap_or_default().to_string_lossy()
-        );
+        let _ = t0.elapsed().as_secs_f64() * 1000.0;
     }
 }
 
@@ -115,11 +110,7 @@ fn prewarm_gst_pipeline(path: &Path) {
     }
     let _ = pipeline.set_state(gst::State::Null);
 
-    let ms = t0.elapsed().as_secs_f64() * 1000.0;
-    eprintln!(
-        "[GST-PREWARM] pipeline warmup={ms:.1}ms for {}",
-        path.file_name().unwrap_or_default().to_string_lossy()
-    );
+    let _ = t0.elapsed().as_secs_f64() * 1000.0;
 }
 
 fn wait_for_async_done(bus: &gst::Bus, timeout: gst::ClockTime) -> Result<(), String> {
@@ -279,9 +270,7 @@ fn preroll_and_seek(
         speed_ms = t_speed.elapsed().as_secs_f64() * 1000.0;
     }
 
-    eprintln!(
-        "[GST-TIMING] preroll_and_seek: paused={paused_ms:.1}ms seek={seek_ms:.1}ms speed={speed_ms:.1}ms start_time={start_time_seconds:.3}s"
-    );
+    let _ = (paused_ms, seek_ms, speed_ms, start_time_seconds);
 
     Ok(())
 }
@@ -413,13 +402,7 @@ impl GstPipelineHandle {
             connect_decodebin_video_only(&decodebin, &videoconvert);
         }
 
-        let t_preroll = Instant::now();
         preroll_and_seek(&pipeline, start_time_seconds, speed)?;
-        let preroll_ms = t_preroll.elapsed().as_secs_f64() * 1000.0;
-        eprintln!(
-            "[GST-TIMING] preroll_and_seek took {preroll_ms:.1}ms for {}",
-            path.file_name().unwrap_or_default().to_string_lossy()
-        );
 
         let (frame_tx, frame_rx) = mpsc::sync_channel::<DecodedFrame>(16);
         let (buf_return_tx, buf_return_rx) = mpsc::channel::<Vec<u8>>();
@@ -431,14 +414,12 @@ impl GstPipelineHandle {
             let tw = target_w;
             let th = target_h;
             let ffr = first_frame_ready.clone();
-            let bridge_t0 = Instant::now();
             std::thread::Builder::new()
                 .name("gst-video-bridge".into())
                 .spawn(move || {
                     let mut buf_pool: Vec<Vec<u8>> = Vec::with_capacity(8);
                     let expected_size = (tw as usize) * (th as usize) * 4;
 
-                    let t_pull = Instant::now();
                     if let Ok(preroll_sample) = video_sink.pull_preroll() {
                         if let Some(buffer) = preroll_sample.buffer() {
                             let pts_seconds = buffer
@@ -463,11 +444,6 @@ impl GstPipelineHandle {
                             }
                         }
                     }
-                    let pull_ms = t_pull.elapsed().as_secs_f64() * 1000.0;
-                    let bridge_ms = bridge_t0.elapsed().as_secs_f64() * 1000.0;
-                    eprintln!(
-                        "[GST-TIMING] bridge: pull_preroll={pull_ms:.1}ms total_to_ready={bridge_ms:.1}ms"
-                    );
                     ffr.store(true, Ordering::Release);
 
                     loop {
@@ -574,11 +550,7 @@ impl GstPipelineHandle {
                 None
             };
 
-        let total_ms = t_total.elapsed().as_secs_f64() * 1000.0;
-        eprintln!(
-            "[GST-TIMING] GstPipelineHandle::start total={total_ms:.1}ms for {}",
-            path.file_name().unwrap_or_default().to_string_lossy()
-        );
+        let _ = t_total.elapsed().as_secs_f64() * 1000.0;
 
         Ok(Self {
             frame_rx,
@@ -720,18 +692,28 @@ impl GstReversePipelineHandle {
             gst::ClockTime::ZERO
         };
 
+        pipeline
+            .seek_simple(
+                gst::SeekFlags::FLUSH | gst::SeekFlags::KEY_UNIT,
+                seek_pos,
+            )
+            .map_err(|e| format!("Reverse position seek failed: {e}"))?;
+        wait_for_async_done(&bus, timeout)
+            .map_err(|e| format!("Reverse position seek error: {e}"))?;
+
         let rate = -(speed.max(0.01));
         pipeline
             .seek(
                 rate,
-                gst::SeekFlags::FLUSH | gst::SeekFlags::ACCURATE,
+                gst::SeekFlags::FLUSH | gst::SeekFlags::KEY_UNIT | gst::SeekFlags::ACCURATE,
                 gst::SeekType::Set,
                 gst::ClockTime::ZERO,
                 gst::SeekType::Set,
                 seek_pos,
             )
-            .map_err(|e| format!("Reverse seek failed: {e}"))?;
-        let _ = wait_for_async_done(&bus, timeout);
+            .map_err(|e| format!("Reverse segment seek failed: {e}"))?;
+        wait_for_async_done(&bus, timeout)
+            .map_err(|e| format!("Reverse segment seek error: {e}"))?;
 
         let (frame_tx, frame_rx) = mpsc::sync_channel::<DecodedFrame>(4);
         let (stop_tx, stop_rx) = mpsc::channel::<()>();
@@ -746,6 +728,7 @@ impl GstReversePipelineHandle {
                 .name("gst-reverse-bridge".into())
                 .spawn(move || {
                     let expected_size = (tw as usize) * (th as usize) * 4;
+                    let mut has_signaled_first_frame = false;
 
                     if let Ok(preroll_sample) = video_sink.pull_preroll() {
                         if let Some(buffer) = preroll_sample.buffer() {
@@ -762,16 +745,21 @@ impl GstReversePipelineHandle {
                                     rgba_data.extend_from_slice(data);
                                     rgba_data.resize(expected_size, 0);
                                 }
-                                let _ = frame_tx.send(DecodedFrame {
-                                    pts_seconds,
-                                    width: tw,
-                                    height: th,
-                                    rgba_data,
-                                });
+                                if frame_tx
+                                    .send(DecodedFrame {
+                                        pts_seconds,
+                                        width: tw,
+                                        height: th,
+                                        rgba_data,
+                                    })
+                                    .is_ok()
+                                {
+                                    ffr.store(true, Ordering::Release);
+                                    has_signaled_first_frame = true;
+                                }
                             }
                         }
                     }
-                    ffr.store(true, Ordering::Release);
 
                     loop {
                         if stop_rx.try_recv().is_ok() {
@@ -822,6 +810,10 @@ impl GstReversePipelineHandle {
                         {
                             return;
                         }
+                        if !has_signaled_first_frame {
+                            ffr.store(true, Ordering::Release);
+                            has_signaled_first_frame = true;
+                        }
                     }
                 })
                 .expect("failed to spawn gst reverse bridge thread")
@@ -857,7 +849,7 @@ impl GstReversePipelineHandle {
         let rate = -(speed.max(0.01));
         let _ = self.pipeline.seek(
             rate,
-            gst::SeekFlags::FLUSH | gst::SeekFlags::ACCURATE,
+            gst::SeekFlags::FLUSH | gst::SeekFlags::KEY_UNIT | gst::SeekFlags::ACCURATE,
             gst::SeekType::Set,
             gst::ClockTime::ZERO,
             gst::SeekType::Set,

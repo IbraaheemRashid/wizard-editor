@@ -1,6 +1,7 @@
 mod audio_mixer;
 mod channel_polling;
 mod constants;
+mod debug_log;
 mod import;
 pub mod pipeline;
 mod playback;
@@ -11,6 +12,7 @@ pub mod workers;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::mpsc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -29,6 +31,8 @@ use playback_engine::PlaybackEngine;
 use texture_cache::TextureCache;
 use workers::preview_worker::PreviewWorkerChannels;
 use workers::scrub_cache_worker::ScrubCacheWorkerChannels;
+
+static REVERSE_ADVANCE_LOG_MS: AtomicU64 = AtomicU64::new(0);
 
 
 pub struct EditorApp {
@@ -155,11 +159,38 @@ impl eframe::App for EditorApp {
                             .is_none_or(|f| f.frame_delivered)
                     }
                 }
-                PlaybackState::PlayingReverse => self
-                    .playback
-                    .reverse
-                    .as_ref()
-                    .is_none_or(|r| r.last_frame_time.is_some()),
+                PlaybackState::PlayingReverse => {
+                    let has_pending = self.playback.pending_reverse.is_some();
+                    let rev_last_frame = self.playback.reverse.as_ref().and_then(|r| r.last_frame_time);
+                    let rev_activated = self.playback.reverse.as_ref().map(|r| r.activated).unwrap_or(false);
+                    // Reverse playhead is driven by decoded frame mapping to avoid double-advancing.
+                    let result = false;
+                    eprintln!("[REVERSE] should_advance={result} pending={has_pending} rev_activated={rev_activated} last_frame={rev_last_frame:?} playhead={:.3}", self.state.project.playback.playhead);
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0);
+                    let prev_ms = REVERSE_ADVANCE_LOG_MS.load(Ordering::Relaxed);
+                    if now_ms.saturating_sub(prev_ms) >= 500 {
+                        REVERSE_ADVANCE_LOG_MS.store(now_ms, Ordering::Relaxed);
+                        // #region agent log
+                        crate::debug_log::emit(
+                            "H5",
+                            "crates/app/src/lib.rs:EditorApp::update",
+                            "reverse should_advance decision",
+                            &format!(
+                                "shouldAdvance={} pendingReverse={} reverseActivated={} reverseLastFrameTime={:?} playhead={:.3}",
+                                result,
+                                has_pending,
+                                rev_activated,
+                                rev_last_frame,
+                                self.state.project.playback.playhead
+                            ),
+                        );
+                        // #endregion
+                    }
+                    result
+                }
             };
             if should_advance {
                 let total_advance = dt + self.playhead_advance_debt_s;
@@ -192,6 +223,7 @@ impl eframe::App for EditorApp {
         );
 
         self.playback.poll_pending_pipeline(now);
+        self.playback.poll_pending_reverse_pipeline(now);
         self.playback
             .manage_pipeline(&mut self.state, &mut self.textures, now, ctx);
         self.playback.manage_shadow_pipeline(&mut self.state, now);
