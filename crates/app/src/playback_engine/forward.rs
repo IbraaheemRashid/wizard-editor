@@ -12,6 +12,7 @@ use crate::pipeline::{
 use crate::texture_cache::TextureCache;
 use crate::workers;
 
+use super::rewind_cache::RewindCacheEntry;
 use super::PlaybackEngine;
 
 impl PlaybackEngine {
@@ -23,7 +24,10 @@ impl PlaybackEngine {
         }
         let fwd = match self.forward.as_ref() {
             Some(f) => f,
-            None => return,
+            None => {
+                self.manage_shadow_for_gap(state, now);
+                return;
+            }
         };
         let current_timeline_clip = fwd.timeline_clip;
 
@@ -383,6 +387,24 @@ impl PlaybackEngine {
                     state.project.playback.playhead = new_playhead;
                 }
                 fwd.frame_delivered = true;
+
+                let timeline_pos = timeline_start + (mapped_source_pts - source_in);
+                let cache_clip_changed = self
+                    .rewind_cache
+                    .last_timeline_clip_id()
+                    .is_some_and(|id| id != fwd.timeline_clip);
+                if cache_clip_changed {
+                    self.rewind_cache.clear();
+                }
+                self.rewind_cache.push(RewindCacheEntry {
+                    timeline_pos,
+                    source_pts: frame.pts_seconds,
+                    clip_id: fwd.clip.0,
+                    timeline_clip_id: fwd.timeline_clip,
+                    width: frame.width,
+                    height: frame.height,
+                    rgba_data: frame.rgba_data.clone(),
+                });
             }
         } else if let Some(timeline_pos) =
             self.find_timeline_hit_for_source_pts(state, frame.pts_seconds)
@@ -440,5 +462,147 @@ impl PlaybackEngine {
             return Some(tc.timeline_start + (pts - tc.source_in));
         }
         None
+    }
+
+    fn manage_shadow_for_gap(&mut self, state: &mut AppState, now: f64) {
+        let playhead = state.project.playback.playhead;
+        let speed = state.project.playback.speed;
+
+        let Some(next_hit) = state.project.timeline.next_video_clip_after_time(playhead) else {
+            return;
+        };
+
+        let time_until_clip = (next_hit.clip.timeline_start - playhead) / speed;
+        if time_until_clip > SHADOW_LOOKAHEAD_S {
+            return;
+        }
+
+        if self
+            .shadow
+            .as_ref()
+            .is_some_and(|s| s.timeline_clip == next_hit.clip.id)
+        {
+            return;
+        }
+        if self
+            .pending_shadow
+            .as_ref()
+            .is_some_and(|s| s.timeline_clip == next_hit.clip.id)
+        {
+            return;
+        }
+
+        let next_clip_id = next_hit.clip.source_id;
+        let next_timeline_clip_id = next_hit.clip.id;
+        let Some(clip) = state.project.clips.get(&next_clip_id) else {
+            return;
+        };
+        let path = clip.path.clone();
+
+        self.shadow = None;
+        self.pending_shadow = None;
+
+        let mut audio_requests = Vec::new();
+        let audio_hits = state
+            .project
+            .timeline
+            .audio_clips_at_time(next_hit.clip.timeline_start);
+        for hit in audio_hits {
+            let Some(aclip) = state.project.clips.get(&hit.clip.source_id) else {
+                continue;
+            };
+            if self.path_has_no_audio(&aclip.path) {
+                continue;
+            }
+            audio_requests.push(ShadowAudioSourceRequest {
+                path: aclip.path.clone(),
+                source_time: hit.source_time,
+            });
+        }
+
+        self.pending_shadow = Some(PendingShadowPipeline::spawn(
+            &path,
+            next_hit.source_time,
+            workers::video_decode_worker::PLAYBACK_DECODE_WIDTH,
+            workers::video_decode_worker::PLAYBACK_DECODE_HEIGHT,
+            self.audio_sample_rate,
+            self.audio_channels,
+            speed,
+            next_clip_id,
+            next_timeline_clip_id,
+            audio_requests,
+            now,
+        ));
+    }
+
+    pub fn manage_shadow_for_stopped(&mut self, state: &mut AppState, now: f64) {
+        let playhead = state.project.playback.playhead;
+
+        let target_hit = state
+            .project
+            .timeline
+            .video_clip_at_time(playhead)
+            .or_else(|| state.project.timeline.next_video_clip_after_time(playhead));
+
+        let Some(hit) = target_hit else {
+            return;
+        };
+
+        if self
+            .shadow
+            .as_ref()
+            .is_some_and(|s| s.timeline_clip == hit.clip.id)
+        {
+            return;
+        }
+        if self
+            .pending_shadow
+            .as_ref()
+            .is_some_and(|s| s.timeline_clip == hit.clip.id)
+        {
+            return;
+        }
+
+        let clip_id = hit.clip.source_id;
+        let timeline_clip_id = hit.clip.id;
+        let Some(clip) = state.project.clips.get(&clip_id) else {
+            return;
+        };
+        let path = clip.path.clone();
+
+        self.shadow = None;
+        self.pending_shadow = None;
+
+        let speed = state.project.playback.speed;
+
+        let mut audio_requests = Vec::new();
+        let clip_time = hit.clip.timeline_start.max(playhead);
+        let audio_hits = state.project.timeline.audio_clips_at_time(clip_time);
+        for ahit in audio_hits {
+            let Some(aclip) = state.project.clips.get(&ahit.clip.source_id) else {
+                continue;
+            };
+            if self.path_has_no_audio(&aclip.path) {
+                continue;
+            }
+            audio_requests.push(ShadowAudioSourceRequest {
+                path: aclip.path.clone(),
+                source_time: ahit.source_time,
+            });
+        }
+
+        self.pending_shadow = Some(PendingShadowPipeline::spawn(
+            &path,
+            hit.source_time,
+            workers::video_decode_worker::PLAYBACK_DECODE_WIDTH,
+            workers::video_decode_worker::PLAYBACK_DECODE_HEIGHT,
+            self.audio_sample_rate,
+            self.audio_channels,
+            speed,
+            clip_id,
+            timeline_clip_id,
+            audio_requests,
+            now,
+        ));
     }
 }

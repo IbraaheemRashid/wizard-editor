@@ -52,6 +52,7 @@ pub fn timeline_panel(ui: &mut egui::Ui, state: &mut AppState, textures: &dyn Te
 
     let mut pending_browser_drop: Option<(Vec<ClipId>, wizard_state::timeline::TrackId, f64)> =
         None;
+    let mut all_clip_rects: Vec<Rect> = Vec::new();
 
     let content_clip_rect = Rect::from_min_max(
         pos2(content_left, clip_area_top),
@@ -136,6 +137,8 @@ pub fn timeline_panel(ui: &mut egui::Ui, state: &mut AppState, textures: &dyn Te
             if clip_rect.max.x < content_left || clip_rect.min.x > content_left + content_width {
                 continue;
             }
+
+            all_clip_rects.push(clip_rect);
 
             let tc_id = tc.id;
             let tc_source_id = tc.source_id;
@@ -358,8 +361,10 @@ pub fn timeline_panel(ui: &mut egui::Ui, state: &mut AppState, textures: &dyn Te
                             state.ui.selection.selected_timeline_clips.clone();
                     } else {
                         state.ui.selection.select_single_timeline_clip(tc_id);
-                        state.ui.timeline.dragging_clips =
-                            [tc_id].into_iter().collect();
+                        if let Some(linked) = tc.linked_to {
+                            state.ui.selection.selected_timeline_clips.insert(linked);
+                        }
+                        state.ui.timeline.dragging_clips = [tc_id].into_iter().collect();
                     }
                     state.ui.timeline.drag_primary_clip = Some(tc_id);
                 }
@@ -369,38 +374,45 @@ pub fn timeline_panel(ui: &mut egui::Ui, state: &mut AppState, textures: &dyn Te
                 let cmd_held = ui.input(|i| i.modifiers.command);
                 if cmd_held {
                     state.ui.selection.toggle_timeline_clip(tc_id);
+                    if let Some(linked) = tc.linked_to {
+                        state.ui.selection.toggle_timeline_clip_to_match(linked, tc_id);
+                    }
                 } else {
                     state.ui.selection.select_single_timeline_clip(tc_id);
+                    if let Some(linked) = tc.linked_to {
+                        state.ui.selection.selected_timeline_clips.insert(linked);
+                    }
                     state.ui.selection.select_single(tc_source_id);
                 }
             }
 
             let is_starred = state.project.starred.contains(&tc_source_id);
-            let has_linked = tc.linked_to.is_some();
+            let multi_selected = state.ui.selection.selected_timeline_clips.len() > 1
+                && state.ui.selection.is_timeline_clip_selected(tc_id);
             clip_response.context_menu(|ui| {
-                if has_linked {
-                    if ui.button("Delete").clicked() {
-                        state.project.snapshot_for_undo();
-                        state.project.timeline.remove_clip_single(tc_id);
-                        state.ui.selection.selected_timeline_clips.remove(&tc_id);
-                        ui.close_menu();
-                    }
-                    if ui.button("Delete Both").clicked() {
-                        state.project.snapshot_for_undo();
+                if ui.button("Delete").clicked() {
+                    state.project.snapshot_for_undo();
+                    if multi_selected {
+                        let to_delete: Vec<_> =
+                            state.ui.selection.selected_timeline_clips.drain().collect();
+                        for id in to_delete {
+                            state.project.timeline.remove_clip(id);
+                        }
+                    } else {
                         state.project.timeline.remove_clip(tc_id);
                         state.ui.selection.selected_timeline_clips.remove(&tc_id);
-                        ui.close_menu();
+                        if let Some(linked) = tc.linked_to {
+                            state.ui.selection.selected_timeline_clips.remove(&linked);
+                        }
                     }
-                } else if ui.button("Delete").clicked() {
-                    state.project.snapshot_for_undo();
-                    state.project.timeline.remove_clip_single(tc_id);
-                    state.ui.selection.selected_timeline_clips.remove(&tc_id);
                     ui.close_menu();
                 }
-                let star_label = if is_starred { "Unstar" } else { "Star" };
-                if ui.button(star_label).clicked() {
-                    state.project.toggle_star(tc_source_id);
-                    ui.close_menu();
+                if !multi_selected {
+                    let star_label = if is_starred { "Unstar" } else { "Star" };
+                    if ui.button(star_label).clicked() {
+                        state.project.toggle_star(tc_source_id);
+                        ui.close_menu();
+                    }
                 }
             });
         }
@@ -437,6 +449,70 @@ pub fn timeline_panel(ui: &mut egui::Ui, state: &mut AppState, textures: &dyn Te
 
     interaction::handle_clip_trim(ui, state, content_left, pps, scroll, tracks_top);
     interaction::handle_clip_drag_drop(ui, state, tracks_top, content_left, pps, scroll);
+
+    let primary_down = ui.input(|i| i.pointer.primary_down());
+    let primary_pressed = ui.input(|i| i.pointer.primary_pressed());
+    let pointer_pos = ui.ctx().pointer_hover_pos();
+
+    if primary_pressed && state.ui.timeline.marquee_origin.is_none() {
+        if let Some(p) = pointer_pos {
+            if content_clip_rect.contains(p) {
+                let on_clip = all_clip_rects.iter().any(|r| r.contains(p));
+                if !on_clip
+                    && state.ui.timeline.dragging_clips.is_empty()
+                    && state.ui.timeline.trimming_clip.is_none()
+                {
+                    state.ui.timeline.marquee_origin = Some((p.x, p.y));
+                    state.ui.timeline.marquee_current = Some((p.x, p.y));
+                    state.ui.selection.clear_timeline_clips();
+                }
+            }
+        }
+    }
+
+    if primary_down {
+        if let (Some(origin), Some(pointer)) =
+            (state.ui.timeline.marquee_origin, pointer_pos)
+        {
+            state.ui.timeline.marquee_current = Some((pointer.x, pointer.y));
+            let marquee_rect =
+                Rect::from_two_pos(pos2(origin.0, origin.1), pos2(pointer.x, pointer.y));
+            state.ui.selection.clear_timeline_clips();
+            for layout in &track_layouts {
+                let y = tracks_top + layout.display_index as f32 * (TRACK_HEIGHT + 2.0);
+                if let Some(track) = state.project.timeline.track_by_id(layout.track_id) {
+                    for tc in &track.clips {
+                        let clip_x = content_left + tc.timeline_start as f32 * pps - scroll;
+                        let clip_w = tc.duration as f32 * pps;
+                        let clip_rect = Rect::from_min_size(
+                            pos2(clip_x, y + 2.0),
+                            vec2(clip_w, TRACK_HEIGHT - 4.0),
+                        );
+                        if marquee_rect.intersects(clip_rect) {
+                            state.ui.selection.selected_timeline_clips.insert(tc.id);
+                            if let Some(linked) = tc.linked_to {
+                                state.ui.selection.selected_timeline_clips.insert(linked);
+                            }
+                        }
+                    }
+                }
+            }
+            content_painter.rect_filled(
+                marquee_rect,
+                CornerRadius::ZERO,
+                Color32::from_rgba_unmultiplied(100, 150, 255, 30),
+            );
+            content_painter.rect_stroke(
+                marquee_rect,
+                CornerRadius::ZERO,
+                Stroke::new(1.0, Color32::from_rgba_unmultiplied(100, 150, 255, 150)),
+                egui::StrokeKind::Outside,
+            );
+        }
+    } else if state.ui.timeline.marquee_origin.is_some() {
+        state.ui.timeline.marquee_origin = None;
+        state.ui.timeline.marquee_current = None;
+    }
 
     let header_clip_rect = Rect::from_min_max(
         pos2(timeline_rect.min.x, clip_area_top),

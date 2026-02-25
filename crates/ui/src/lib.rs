@@ -1,5 +1,7 @@
 pub mod browser;
 pub mod constants;
+// FOURTH PANEL
+pub mod inspector;
 pub mod preview;
 pub mod theme;
 pub mod timeline;

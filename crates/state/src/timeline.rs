@@ -676,6 +676,29 @@ impl Timeline {
         best
     }
 
+    pub fn next_video_clip_after_time(&self, time: f64) -> Option<PlayheadHit> {
+        let mut best: Option<PlayheadHit> = None;
+        let mut best_start = f64::INFINITY;
+
+        for track in &self.video_tracks {
+            if !track.visible {
+                continue;
+            }
+            for tc in &track.clips {
+                if tc.timeline_start > time && tc.timeline_start < best_start {
+                    best_start = tc.timeline_start;
+                    best = Some(PlayheadHit {
+                        track_id: track.id,
+                        clip: tc.clone(),
+                        source_time: tc.source_in,
+                    });
+                }
+            }
+        }
+
+        best
+    }
+
     pub fn time_remaining_in_clip(&self, id: TimelineClipId, playhead: f64) -> Option<f64> {
         let (_, _, tc) = self.find_clip(id)?;
         let clip_end = tc.timeline_start + tc.duration;

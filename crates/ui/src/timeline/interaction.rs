@@ -3,7 +3,10 @@ use wizard_state::project::{AppState, TrimEdge};
 
 use crate::theme;
 
-use super::layout::*;
+use super::layout::{
+    build_track_layout, snap_time_to_clip_boundaries_with_duration, MIN_CLIP_DURATION,
+    TRACK_HEIGHT, ZOOM_MAX, ZOOM_MIN,
+};
 
 pub fn handle_clip_trim(
     ui: &egui::Ui,
@@ -149,7 +152,18 @@ pub fn handle_clip_drag_drop(
 
         let new_pos =
             (((pointer.x - content_left + scroll) / pps).max(0.0) as f64 - grab_offset).max(0.0);
-        let (new_pos, _) = snap_time_to_clip_boundaries(state, new_pos, pps, Some(src_clip_id));
+        let clip_duration = state
+            .project
+            .timeline
+            .find_clip(src_clip_id)
+            .map(|(_, _, tc)| tc.duration);
+        let (new_pos, _) = snap_time_to_clip_boundaries_with_duration(
+            state,
+            new_pos,
+            pps,
+            Some(src_clip_id),
+            clip_duration,
+        );
 
         state.project.snapshot_for_undo();
         if src_track_id == dst_track_id {
@@ -166,8 +180,18 @@ pub fn handle_clip_drag_drop(
     } else {
         let new_primary_pos =
             (((pointer.x - content_left + scroll) / pps).max(0.0) as f64 - grab_offset).max(0.0);
-        let (new_primary_pos, _) =
-            snap_time_to_clip_boundaries(state, new_primary_pos, pps, Some(primary_id));
+        let primary_duration = state
+            .project
+            .timeline
+            .find_clip(primary_id)
+            .map(|(_, _, tc)| tc.duration);
+        let (new_primary_pos, _) = snap_time_to_clip_boundaries_with_duration(
+            state,
+            new_primary_pos,
+            pps,
+            Some(primary_id),
+            primary_duration,
+        );
         let delta = new_primary_pos - original_start;
 
         state.project.snapshot_for_undo();

@@ -145,14 +145,18 @@ impl eframe::App for EditorApp {
                     }
                 }
                 PlaybackState::PlayingReverse => {
-                    let has_pending_rev = self.playback.pending_reverse.is_some();
-                    if has_pending_rev {
-                        false
+                    if !self.playback.rewind_cache.is_empty() {
+                        true
                     } else {
-                        self.playback
-                            .reverse
-                            .as_ref()
-                            .is_none_or(|r| r.last_frame_time.is_some())
+                        let has_pending_rev = self.playback.pending_reverse.is_some();
+                        if has_pending_rev {
+                            false
+                        } else {
+                            self.playback
+                                .reverse
+                                .as_ref()
+                                .is_none_or(|r| r.last_frame_time.is_some())
+                        }
                     }
                 }
             };
@@ -165,7 +169,7 @@ impl eframe::App for EditorApp {
                     .project
                     .playback
                     .advance(dt_for_advance, duration);
-            } else if self.state.project.playback.state == PlaybackState::Stopped {
+            } else {
                 self.playhead_advance_debt_s = 0.0;
             }
             if dt > 0.0 {
@@ -187,9 +191,13 @@ impl eframe::App for EditorApp {
 
         self.playback.poll_pending_pipeline(now);
         self.playback.poll_pending_reverse_pipeline(now);
+        self.playback.poll_pending_reverse_shadow(now);
+        self.playback.poll_reverse_shadow_frame();
         self.playback
             .manage_pipeline(&mut self.state, &mut self.textures, now, ctx);
         self.playback.manage_shadow_pipeline(&mut self.state, now);
+        self.playback
+            .manage_reverse_shadow_pipeline(&mut self.state, now);
         self.poll_import_tasks(ctx);
         self.poll_folder_watcher();
         egui::TopBottomPanel::top("top_panel")
@@ -220,6 +228,15 @@ impl eframe::App for EditorApp {
             }
         }
 
+        //FOURTH PANEL
+
+       /* egui::SidePanel::right("inspector_panel")
+            .width_range(220.0..=520.0)
+            .default_width(300.0)
+            .show(ctx, |ui| {
+                wizard_ui::inspector::inspector_panel(ui, &mut self.state);
+            });
+*/
         self.enqueue_visible_previews();
         self.enqueue_scrub_cache_for_timeline_clips();
         self.playback
@@ -277,6 +294,13 @@ impl eframe::App for EditorApp {
 
                     if self.playback.shadow.is_some() {
                         ui.label("Shadow: active");
+                    }
+                    if self.playback.reverse_shadow.is_some() {
+                        ui.label("RevShadow: active");
+                    }
+                    let cache_len = self.playback.rewind_cache.len();
+                    if cache_len > 0 {
+                        ui.label(format!("RewindCache: {cache_len}"));
                     }
                 });
         }

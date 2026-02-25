@@ -63,7 +63,7 @@ fn decode_gop_range_with(
     let expected_size = (target_w as usize) * (target_h as usize) * 4;
     let mut frames = Vec::new();
 
-    match decoder.seek_and_decode(gop_start) {
+    match decoder.seek_and_decode_keyunit(gop_start) {
         Some(img) => {
             let pts = decoder.last_decode_time().unwrap_or(gop_start);
             if pts <= gop_end + 0.05 {

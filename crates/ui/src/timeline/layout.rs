@@ -60,6 +60,16 @@ pub fn snap_time_to_clip_boundaries(
     pps: f32,
     exclude_clip: Option<wizard_state::timeline::TimelineClipId>,
 ) -> (f64, bool) {
+    snap_time_to_clip_boundaries_with_duration(state, candidate_time, pps, exclude_clip, None)
+}
+
+pub fn snap_time_to_clip_boundaries_with_duration(
+    state: &AppState,
+    candidate_time: f64,
+    pps: f32,
+    exclude_clip: Option<wizard_state::timeline::TimelineClipId>,
+    clip_duration: Option<f64>,
+) -> (f64, bool) {
     if pps <= 0.0 {
         return (candidate_time.max(0.0), false);
     }
@@ -68,9 +78,22 @@ pub fn snap_time_to_clip_boundaries(
     let mut best_time = candidate_time.max(0.0);
     let mut best_dist = f64::INFINITY;
 
+    let mut excluded_ids: std::collections::HashSet<wizard_state::timeline::TimelineClipId> =
+        std::collections::HashSet::new();
+    if let Some(id) = exclude_clip {
+        excluded_ids.insert(id);
+        if let Some((_, _, tc)) = state.project.timeline.find_clip(id) {
+            if let Some(linked) = tc.linked_to {
+                excluded_ids.insert(linked);
+            }
+        }
+    }
+
+    let right_edge = clip_duration.map(|d| candidate_time + d);
+
     for track in state.project.timeline.all_tracks() {
         for tc in &track.clips {
-            if exclude_clip.is_some_and(|id| id == tc.id) {
+            if excluded_ids.contains(&tc.id) {
                 continue;
             }
             let start = tc.timeline_start;
@@ -87,7 +110,27 @@ pub fn snap_time_to_clip_boundaries(
                 best_dist = end_dist;
                 best_time = end;
             }
+
+            if let Some(re) = right_edge {
+                let right_to_start_dist = (re - start).abs();
+                if right_to_start_dist <= snap_threshold_time && right_to_start_dist < best_dist {
+                    best_dist = right_to_start_dist;
+                    best_time = start - clip_duration.unwrap();
+                }
+
+                let right_to_end_dist = (re - end).abs();
+                if right_to_end_dist <= snap_threshold_time && right_to_end_dist < best_dist {
+                    best_dist = right_to_end_dist;
+                    best_time = end - clip_duration.unwrap();
+                }
+            }
         }
+    }
+
+    let left_to_zero_dist = candidate_time.abs();
+    if left_to_zero_dist <= snap_threshold_time && left_to_zero_dist < best_dist {
+        best_dist = left_to_zero_dist;
+        best_time = 0.0;
     }
 
     if best_dist.is_finite() {

@@ -293,7 +293,7 @@ impl GstPipelineHandle {
         let pos = cur_pos.unwrap_or(gst::ClockTime::ZERO);
         let _ = self.pipeline.seek(
             speed,
-            gst::SeekFlags::FLUSH | gst::SeekFlags::KEY_UNIT,
+            gst::SeekFlags::FLUSH | gst::SeekFlags::ACCURATE,
             gst::SeekType::Set,
             pos,
             gst::SeekType::End,

@@ -233,7 +233,7 @@ pub(crate) fn preroll_and_seek(
     if start_time_seconds > 0.01 {
         let seek_pos = gst::ClockTime::from_nseconds((start_time_seconds * 1_000_000_000.0) as u64);
         pipeline
-            .seek_simple(gst::SeekFlags::FLUSH | gst::SeekFlags::KEY_UNIT, seek_pos)
+            .seek_simple(gst::SeekFlags::FLUSH | gst::SeekFlags::ACCURATE, seek_pos)
             .map_err(|e| format!("Seek failed: {e}"))?;
         wait_for_async_done(&bus, timeout).map_err(|e| format!("Seek error: {e}"))?;
     }
@@ -243,7 +243,7 @@ pub(crate) fn preroll_and_seek(
         let pos = cur_pos.unwrap_or(gst::ClockTime::ZERO);
         let _ = pipeline.seek(
             speed,
-            gst::SeekFlags::FLUSH | gst::SeekFlags::KEY_UNIT,
+            gst::SeekFlags::FLUSH | gst::SeekFlags::ACCURATE,
             gst::SeekType::Set,
             pos,
             gst::SeekType::End,

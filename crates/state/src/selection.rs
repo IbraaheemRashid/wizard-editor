@@ -34,6 +34,14 @@ impl Selection {
         }
     }
 
+    pub fn toggle_timeline_clip_to_match(&mut self, id: TimelineClipId, match_id: TimelineClipId) {
+        if self.selected_timeline_clips.contains(&match_id) {
+            self.selected_timeline_clips.insert(id);
+        } else {
+            self.selected_timeline_clips.remove(&id);
+        }
+    }
+
     pub fn clear_timeline_clips(&mut self) {
         self.selected_timeline_clips.clear();
     }

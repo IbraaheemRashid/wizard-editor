@@ -113,6 +113,23 @@ impl GstFrameDecoder {
             gst::ClockTime::from_nseconds((time_seconds.max(0.0) * 1_000_000_000.0) as u64);
         if self
             .pipeline
+            .seek_simple(gst::SeekFlags::FLUSH | gst::SeekFlags::ACCURATE, seek_pos)
+            .is_err()
+        {
+            return None;
+        }
+
+        self.last_decode_ts = None;
+        self.pull_next_frame()
+    }
+
+    pub fn seek_and_decode_keyunit(&mut self, time_seconds: f64) -> Option<image::RgbaImage> {
+        self.ensure_playing();
+
+        let seek_pos =
+            gst::ClockTime::from_nseconds((time_seconds.max(0.0) * 1_000_000_000.0) as u64);
+        if self
+            .pipeline
             .seek_simple(gst::SeekFlags::FLUSH | gst::SeekFlags::KEY_UNIT, seek_pos)
             .is_err()
         {
@@ -165,7 +182,7 @@ impl GstFrameDecoder {
             gst::ClockTime::from_nseconds((time_seconds.max(0.0) * 1_000_000_000.0) as u64);
         let _ = self
             .pipeline
-            .seek_simple(gst::SeekFlags::FLUSH | gst::SeekFlags::KEY_UNIT, seek_pos);
+            .seek_simple(gst::SeekFlags::FLUSH | gst::SeekFlags::ACCURATE, seek_pos);
         self.last_decode_ts = None;
     }
 

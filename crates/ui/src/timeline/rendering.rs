@@ -6,7 +6,10 @@ use wizard_state::timeline::TrackKind;
 use crate::theme;
 use crate::TextureLookup;
 
-use super::layout::*;
+use super::layout::{
+    build_track_layout, snap_time_to_clip_boundaries_with_duration, RULER_HEIGHT, SCROLLBAR_HEIGHT,
+    THUMB_WIDTH, TRACK_HEIGHT, V_SCROLLBAR_WIDTH,
+};
 
 pub struct ClipGhostParams<'a> {
     pub clip_id: &'a ClipId,
@@ -237,8 +240,16 @@ pub fn draw_drag_ghosts(
         raw_drop_time
     };
     let exclude_clip = state.ui.timeline.drag_primary_clip;
-    let (drop_time, _snapped) =
-        snap_time_to_clip_boundaries(state, unsnapped_drop_time, pps, exclude_clip);
+    let clip_duration = exclude_clip
+        .and_then(|id| state.project.timeline.find_clip(id))
+        .map(|(_, _, tc)| tc.duration);
+    let (drop_time, _snapped) = snap_time_to_clip_boundaries_with_duration(
+        state,
+        unsnapped_drop_time,
+        pps,
+        exclude_clip,
+        clip_duration,
+    );
 
     let paired_track_id = track_layouts[target_display_idx].track_id;
     let paired_id = state.project.timeline.paired_track_id(paired_track_id);

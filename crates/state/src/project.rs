@@ -186,6 +186,8 @@ pub struct TimelineUiState {
     pub drag_primary_clip: Option<TimelineClipId>,
     pub drag_grab_offset: Option<f64>,
     pub trimming_clip: Option<TrimState>,
+    pub marquee_origin: Option<(f32, f32)>,
+    pub marquee_current: Option<(f32, f32)>,
 }
 
 impl Default for TimelineUiState {
@@ -199,6 +201,8 @@ impl Default for TimelineUiState {
             drag_primary_clip: None,
             drag_grab_offset: None,
             trimming_clip: None,
+            marquee_origin: None,
+            marquee_current: None,
         }
     }
 }

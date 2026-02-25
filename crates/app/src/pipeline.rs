@@ -155,6 +155,14 @@ impl PendingReversePipeline {
     }
 }
 
+pub struct ReverseShadowState {
+    pub handle: GstReversePipelineHandle,
+    pub clip: (ClipId, PathBuf),
+    pub timeline_clip: TimelineClipId,
+    pub first_frame_ready: bool,
+    pub buffered_frame: Option<DecodedFrame>,
+}
+
 pub struct ShadowAudioSourceRequest {
     pub path: PathBuf,
     pub source_time: f64,
